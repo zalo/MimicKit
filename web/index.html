@@ -115,6 +115,20 @@ let taskTarget = [3, 0];     // XY world-space target for heading/location
 // PD action rescaling: ASE LLC outputs [-1,1], needs offset + scale * action
 const pdActionOffset = [0.0,0.2618,0.0,0.0,0.17455,0.0,0.2618,0.0,0.87265,1.39625,0.0,0.0,0.0,-0.2618,0.0,-0.87265,-1.39625,-0.2618,0.0,-0.69815,1.39625,0.0,0.0,0.0,0.2618,0.0,-0.69815,1.39625,0.0,0.0,0.0];
 const pdActionScale = [1.0472,1.309,1.2217,0.8727,0.87265,0.7854,2.1817,1.5708,1.91985,1.39625,1.5708,1.5708,1.5708,2.1817,1.5708,1.91985,1.39625,0.7854,1.0472,1.74535,1.39625,0.5236,0.9599,0.6981,0.7854,1.0472,1.74535,1.39625,0.5236,0.9599,0.6981];
+
+// ASE PD gains: kp=5, kd=0.1, maxForce from gear values in ASE MJCF
+const aseKp = 5.0, aseKd = 0.1;
+const aseMaxForce = [200,200,200,50,50,50,100,100,100,70,50,50,50,100,100,100,70,100,150,50,150,50,50,50,100,150,50,150,50,50,50];
+
+function setDrivesForASE() {
+    for (const d of origDrives) {
+        const drive = new PhysX.PxArticulationDrive(aseKp, aseKd, aseMaxForce[0] || 200, E_FORCE);
+        d.joint.setDriveParams(d.axisEnum, drive);
+    }
+}
+function setDrivesForMimicKit() {
+    applyDriveParams(); // restores original drives
+}
 const RESET_GRACE = 90;
 
 function quatFromTwoVec(from, to) {
@@ -1681,7 +1695,14 @@ async function init() {
         const modeParams = { mode: 'Free' };
         skillFolder.add(modeParams, 'mode', modeOpts).name('Controller').onChange(v => {
             activeMode = v.toLowerCase();
-            console.log('Mode:', activeMode);
+            // Switch PD gains to match the active LLC
+            if (activeMode === 'free') {
+                setDrivesForMimicKit();
+            } else {
+                setDrivesForASE();
+            }
+            window._aseObsLogged = false; window._aseLLCLogged = false; // re-enable debug logging
+            console.log('Mode:', activeMode, activeMode === 'free' ? '(MimicKit drives)' : '(ASE drives: kp=5, kd=0.1)');
         });
 
         // Target position (for heading/location/reach/strike modes)
