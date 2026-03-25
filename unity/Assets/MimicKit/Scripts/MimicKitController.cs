@@ -336,25 +336,20 @@ public class MimicKitController : MonoBehaviour
 
     void SetDofPositions(float[] dofPos)
     {
-        var dofStarts = new List<int>();
-        rootBody.GetDofStartIndices(dofStarts);
-
         for (int i = 0; i < mjcf.dofInfo.Count; i++)
         {
             var dof = mjcf.dofInfo[i];
             if (!bodyMap.ContainsKey(dof.child_body)) continue;
             var ab = bodyMap[dof.child_body];
-            int bodyIdx = bodyEntries.FindIndex(e => e.name == dof.child_body);
-            if (bodyIdx < 0 || bodyIdx >= dofStarts.Count) continue;
 
-            int startIdx = dofStarts[bodyIdx];
-            int localAxis = dof.physx_axis;
-
-            // jointPosition is a reducedCoordinate buffer indexed by dofStart + localAxis
-            var jp = new ArticulationReducedSpace(0f, 0f, 0f);
-            jp[localAxis] = dofPos[i];
+            // Read existing (correctly-sized) reduced space, modify one axis, write back
+            var jp = ab.jointPosition;
+            jp[dof.physx_axis] = dofPos[i];
             ab.jointPosition = jp;
-            ab.jointVelocity = new ArticulationReducedSpace(0f, 0f, 0f);
+
+            var jv = ab.jointVelocity;
+            jv[dof.physx_axis] = 0f;
+            ab.jointVelocity = jv;
         }
     }
 
