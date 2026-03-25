@@ -1536,6 +1536,12 @@ async function mainLoop(timestamp) {
                     if (activeMode !== 'free' && aseLLCSession && hlcSessions[activeMode]) {
                         // ASE HLC → LLC pipeline
                         const aseObs = buildASEObs(links);
+                        if (!window._aseObsLogged) {
+                            window._aseObsLogged = true;
+                            console.log('ASE obs[0:10]:', Array.from(aseObs.slice(0,10)).map(v=>v.toFixed(3)));
+                            console.log('ASE obs range:', Math.min(...aseObs).toFixed(3), 'to', Math.max(...aseObs).toFixed(3));
+                            console.log('ASE obs non-zero:', Array.from(aseObs).filter(v=>Math.abs(v)>0.001).length, '/ 253');
+                        }
                         // Compute task obs
                         const rootPos = [links[0].link.getGlobalPose().get_p().get_x(),
                                          links[0].link.getGlobalPose().get_p().get_y(),
@@ -1580,6 +1586,12 @@ async function mainLoop(timestamp) {
                             latent: new ort.Tensor('float32', hlcLatent, [1, hlcLatent.length])
                         });
                         currentAction = llcResult.action.data;
+                        if (!window._aseLLCLogged) {
+                            window._aseLLCLogged = true;
+                            console.log('HLC latent[0:5]:', Array.from(hlcLatent).slice(0,5).map(v=>v.toFixed(3)));
+                            console.log('ASE LLC action[0:5]:', Array.from(currentAction).slice(0,5).map(v=>v.toFixed(3)));
+                            console.log('ASE LLC action range:', Math.min(...currentAction).toFixed(3), 'to', Math.max(...currentAction).toFixed(3));
+                        }
                         if (currentAction) applyActions(currentAction);
                     } else {
                         // MimicKit LLC (free mode with latent presets)
