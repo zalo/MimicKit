@@ -21,6 +21,7 @@ ONNX neural network inference.
 5. Create an empty GameObject, name it `MimicKit`.
 6. Add the `MimicKitController` component.
 7. Drag `Assets/MimicKit/Models/ase_humanoid_sword_shield_actor.onnx` into the **Model Asset** field.
+   (The same ONNX file is also in `Assets/StreamingAssets/` for runtime metadata extraction.)
 8. (Optional) Add the `MimicKitSceneSetup` component for auto-creating ground, camera, and lighting.
 9. Press Play.
 
@@ -32,7 +33,7 @@ The ONNX model contains baked metadata (`mimickit_config`) with:
 
 At runtime, `MimicKitController`:
 1. Loads the ONNX model via Unity Inference Engine
-2. Reads `mimickit_config` from `ONNXModelMetadata.MetadataProps`
+2. Scans the raw ONNX bytes (from StreamingAssets) for the `mimickit_config` protobuf metadata key
 3. Parses the MJCF XML to build an `ArticulationBody` hierarchy with correct joint types, limits, drives, mass, and inertia
 4. Each `FixedUpdate` (at 120Hz), runs 1 physics substep; every 4th substep, runs the neural network policy
 5. The policy outputs joint position targets, which are applied as ArticulationDrive targets
@@ -72,6 +73,6 @@ MimicKitController.cs
 ├── BuildObservation()   - Compute 158-dim observation vector (matches Python)
 └── ApplyActions()       - Set ArticulationDrive targets from policy output
 
-MJCFParser.cs (static)
+MJCFParser (static class, same file)
 └── Parse()              - Convert MJCF XML → bodies, joints, geoms, FK data
 ```

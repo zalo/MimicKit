@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using UnityEngine;
 using Unity.InferenceEngine;
 using Newtonsoft.Json;
@@ -19,6 +20,9 @@ public class MimicKitController : MonoBehaviour
     [Header("Model")]
     [Tooltip("ONNX model asset with baked MimicKit metadata")]
     public ModelAsset modelAsset;
+
+    [Tooltip("Path to ONNX file relative to StreamingAssets (for runtime metadata extraction)")]
+    public string onnxFileName = "ase_humanoid_sword_shield_actor.onnx";
 
     [Header("Simulation")]
     [Tooltip("Physics substeps per policy step (4 = 120Hz physics / 30Hz policy)")]
@@ -97,12 +101,15 @@ public class MimicKitController : MonoBehaviour
 
     void ParseMetadata()
     {
-        // Read metadata from ONNX via Unity's ONNXModelMetadata
-        var meta = ONNXModelMetadata.CreateFrom(modelAsset);
-        if (meta.MetadataProps == null || !meta.MetadataProps.ContainsKey("mimickit_config"))
+        // ONNXModelMetadata is Editor-only (ONNX.Editor.dll), so at runtime we
+        // scan the raw ONNX protobuf bytes for our 'mimickit_config' sentinel,
+        // exactly like the web demo does.
+        string onnxPath = System.IO.Path.Combine(Application.streamingAssetsPath, onnxFileName);
+        byte[] onnxBytes = System.IO.File.ReadAllBytes(onnxPath);
+        string json = ExtractOnnxMetadata(onnxBytes);
+        if (json == null)
             throw new Exception("ONNX model missing 'mimickit_config' metadata key.");
 
-        string json = meta.MetadataProps["mimickit_config"];
         var root = JObject.Parse(json);
 
         config = new MimicKitConfig
@@ -426,7 +433,8 @@ public class MimicKitController : MonoBehaviour
         var output = worker.PeekOutput("action") as Tensor<float>;
         if (output != null)
         {
-            output.ReadbackAndClone().CopyTo(currentAction, 0);
+            var data = output.ReadbackAndClone().DownloadToArray();
+            Array.Copy(data, currentAction, Mathf.Min(data.Length, currentAction.Length));
         }
 
         ApplyActions(currentAction);
@@ -755,6 +763,56 @@ public class MimicKitController : MonoBehaviour
         go.layer = layer;
         foreach (Transform child in go.transform)
             SetLayerRecursive(child.gameObject, layer);
+    }
+
+    /// <summary>
+    /// Scan ONNX protobuf bytes for the 'mimickit_config' sentinel key and
+    /// extract the JSON config string that follows it. Matches the web demo approach.
+    /// </summary>
+    static string ExtractOnnxMetadata(byte[] bytes)
+    {
+        byte[] sentinel = Encoding.UTF8.GetBytes("mimickit_config");
+
+        for (int i = 0; i < bytes.Length - sentinel.Length - 10; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < sentinel.Length; j++)
+            {
+                if (bytes[i + j] != sentinel[j]) { match = false; break; }
+            }
+            if (!match) continue;
+
+            // Found the key. Search forward for protobuf value field tag (0x12)
+            int searchStart = i + sentinel.Length;
+            for (int k = searchStart; k < Mathf.Min(searchStart + 20, bytes.Length); k++)
+            {
+                if (bytes[k] == 0x12)
+                {
+                    // Read varint length
+                    int len = 0, shift = 0, pos = k + 1;
+                    while (pos < bytes.Length)
+                    {
+                        byte b = bytes[pos++];
+                        len |= (b & 0x7f) << shift;
+                        shift += 7;
+                        if ((b & 0x80) == 0) break;
+                    }
+                    if (len > 0 && pos + len <= bytes.Length)
+                    {
+                        string jsonStr = Encoding.UTF8.GetString(bytes, pos, len);
+                        try
+                        {
+                            JObject.Parse(jsonStr); // validate
+                            Debug.Log($"MimicKit: Extracted ONNX metadata ({len / 1024}KB)");
+                            return jsonStr;
+                        }
+                        catch { }
+                    }
+                    break;
+                }
+            }
+        }
+        return null;
     }
 
     static float GaussianRandom()
