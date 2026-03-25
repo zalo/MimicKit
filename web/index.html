@@ -2371,7 +2371,18 @@ async function mainLoop(timestamp) {
                     try {
                         const obs = buildObservationMuJoCo();
                         currentAction = await runPolicy(obs);
-                        if (currentAction) applyMuJoCoActions(currentAction);
+                        if (currentAction) {
+                            if (!window._mjLogCount) window._mjLogCount = 0;
+                            if (window._mjLogCount < 3) {
+                                window._mjLogCount++;
+                                const actSample = Array.from(currentAction).slice(0, 8).map(v => v.toFixed(3));
+                                const obsSample = Array.from(obs).slice(0, 13).map(v => v.toFixed(3));
+                                const ctrlBefore = [];
+                                for (let ci = 0; ci < Math.min(8, mjModel.nu); ci++) ctrlBefore.push(mjData.ctrl[ci].toFixed(3));
+                                console.log(`MJ policy step ${window._mjLogCount}: obs[0..12]=[${obsSample}] action[0..7]=[${actSample}] ctrl_before=[${ctrlBefore}]`);
+                            }
+                            applyMuJoCoActions(currentAction);
+                        }
                     } catch (e) {
                         if (!window._policyErrCount) window._policyErrCount = 0;
                         if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
