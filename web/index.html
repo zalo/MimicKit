@@ -111,6 +111,10 @@ let aseLLCSession = null;   // ONNX session for ASE LLC (253-dim obs)
 let hlcSessions = {};        // { heading: session, location: session, ... }
 let activeMode = 'free';     // 'free' | 'heading' | 'location' | 'reach' | 'strike'
 let taskTarget = [3, 0];     // XY world-space target for heading/location
+
+// PD action rescaling: ASE LLC outputs [-1,1], needs offset + scale * action
+const pdActionOffset = [0.0,0.2618,0.0,0.0,0.17455,0.0,0.2618,0.0,0.87265,1.39625,0.0,0.0,0.0,-0.2618,0.0,-0.87265,-1.39625,-0.2618,0.0,-0.69815,1.39625,0.0,0.0,0.0,0.2618,0.0,-0.69815,1.39625,0.0,0.0,0.0];
+const pdActionScale = [1.0472,1.309,1.2217,0.8727,0.87265,0.7854,2.1817,1.5708,1.91985,1.39625,1.5708,1.5708,1.5708,2.1817,1.5708,1.91985,1.39625,0.7854,1.0472,1.74535,1.39625,0.5236,0.9599,0.6981,0.7854,1.0472,1.74535,1.39625,0.5236,0.9599,0.6981];
 const RESET_GRACE = 90;
 
 function quatFromTwoVec(from, to) {
@@ -1585,12 +1589,17 @@ async function mainLoop(timestamp) {
                             obs: new ort.Tensor('float32', aseObs, [1, aseObs.length]),
                             latent: new ort.Tensor('float32', hlcLatent, [1, hlcLatent.length])
                         });
-                        currentAction = llcResult.action.data;
+                        const rawAction = llcResult.action.data;
+                        // Rescale from [-1,1] to PD targets: offset + scale * action
+                        currentAction = new Float32Array(rawAction.length);
+                        for (let i = 0; i < rawAction.length; i++) {
+                            currentAction[i] = pdActionOffset[i] + pdActionScale[i] * rawAction[i];
+                        }
                         if (!window._aseLLCLogged) {
                             window._aseLLCLogged = true;
                             console.log('HLC latent[0:5]:', Array.from(hlcLatent).slice(0,5).map(v=>v.toFixed(3)));
-                            console.log('ASE LLC action[0:5]:', Array.from(currentAction).slice(0,5).map(v=>v.toFixed(3)));
-                            console.log('ASE LLC action range:', Math.min(...currentAction).toFixed(3), 'to', Math.max(...currentAction).toFixed(3));
+                            console.log('ASE LLC raw action[0:5]:', Array.from(rawAction).slice(0,5).map(v=>v.toFixed(3)));
+                            console.log('ASE LLC scaled action[0:5]:', Array.from(currentAction).slice(0,5).map(v=>v.toFixed(3)));
                         }
                         if (currentAction) applyActions(currentAction);
                     } else {
