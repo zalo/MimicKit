@@ -66,6 +66,9 @@ public class MimicKitController : MonoBehaviour
     List<BodyEntry> bodyEntries = new List<BodyEntry>();
     Dictionary<string, ArticulationBody> bodyMap = new Dictionary<string, ArticulationBody>();
 
+    // --- Physics material (matching Isaac Lab: friction=1, restitution=0) ---
+    PhysicsMaterial physicsMat;
+
     // --- Inference ---
     Model model;
     Worker worker;
@@ -219,8 +222,16 @@ public class MimicKitController : MonoBehaviour
 
     void BuildArticulation()
     {
+        // Shared physics material matching Isaac Lab training (friction=1, bounciness=0)
+        physicsMat = new PhysicsMaterial("MimicKit");
+        physicsMat.staticFriction = 1.0f;
+        physicsMat.dynamicFriction = 1.0f;
+        physicsMat.bounciness = 0.0f;
+        physicsMat.frictionCombine = PhysicsMaterialCombine.Average;
+        physicsMat.bounceCombine = PhysicsMaterialCombine.Average;
+
         // The MJCF data is Z-up. Unity is Y-up.
-        // We build everything in Unity's Y-up frame by swapping Z<->Y during construction.
+        // We build everything in Unity's Y-up frame via -90° rotation around X.
 
         foreach (var body in mjcf.bodies)
         {
@@ -818,48 +829,57 @@ public class MimicKitController : MonoBehaviour
 
     void AddCollider(GameObject go, MJCFGeom geom, GameObject visualMesh)
     {
+        Collider col = null;
+
         if (geom.type == "sphere")
         {
-            var col = go.AddComponent<SphereCollider>();
-            col.radius = geom.radius;
-            col.center = ZupToYup(geom.pos);
+            var sc = go.AddComponent<SphereCollider>();
+            sc.radius = geom.radius;
+            sc.center = ZupToYup(geom.pos);
+            col = sc;
         }
         else if (geom.type == "capsule" && geom.fromto != null)
         {
-            var col = go.AddComponent<CapsuleCollider>();
+            var cc = go.AddComponent<CapsuleCollider>();
             var ft = geom.fromto;
             Vector3 p0 = ZupToYup(new float[] { ft[0], ft[1], ft[2] });
             Vector3 p1 = ZupToYup(new float[] { ft[3], ft[4], ft[5] });
             Vector3 dir = p1 - p0;
             float len = dir.magnitude;
-            col.radius = geom.radius;
-            col.height = len + 2 * geom.radius;
-            col.center = (p0 + p1) * 0.5f;
+            cc.radius = geom.radius;
+            cc.height = len + 2 * geom.radius;
+            cc.center = (p0 + p1) * 0.5f;
             float ax = Mathf.Abs(dir.x), ay = Mathf.Abs(dir.y), az = Mathf.Abs(dir.z);
-            if (ay >= ax && ay >= az) col.direction = 1;
-            else if (ax >= az) col.direction = 0;
-            else col.direction = 2;
+            if (ay >= ax && ay >= az) cc.direction = 1;
+            else if (ax >= az) cc.direction = 0;
+            else cc.direction = 2;
+            col = cc;
         }
         else if (geom.type == "box" && geom.halfExtents != null)
         {
-            var col = go.AddComponent<BoxCollider>();
-            col.size = new Vector3(geom.halfExtents[0] * 2, geom.halfExtents[2] * 2, geom.halfExtents[1] * 2);
-            col.center = ZupToYup(geom.pos);
+            var bc = go.AddComponent<BoxCollider>();
+            bc.size = new Vector3(geom.halfExtents[0] * 2, geom.halfExtents[2] * 2, geom.halfExtents[1] * 2);
+            bc.center = ZupToYup(geom.pos);
+            col = bc;
         }
         else if (geom.type == "cylinder")
         {
-            // Use convex MeshCollider on the visual child (inherits its local transform)
             if (visualMesh != null)
             {
                 var mf = visualMesh.GetComponent<MeshFilter>();
                 if (mf != null && mf.sharedMesh != null)
                 {
-                    var col = visualMesh.AddComponent<MeshCollider>();
-                    col.sharedMesh = mf.sharedMesh;
-                    col.convex = true;
+                    var mc = visualMesh.AddComponent<MeshCollider>();
+                    mc.sharedMesh = mf.sharedMesh;
+                    mc.convex = true;
+                    mc.material = physicsMat;
                 }
             }
+            return;
         }
+
+        if (col != null)
+            col.material = physicsMat;
     }
 
     GameObject AddVisualMesh(GameObject parent, MJCFGeom geom, Color color)
