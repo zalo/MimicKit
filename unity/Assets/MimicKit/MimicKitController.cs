@@ -670,17 +670,18 @@ public class MimicKitController : MonoBehaviour
     /// <summary>Z-up quaternion [x,y,z,w] (Unity Quaternion) -> Y-up Unity Quaternion</summary>
     static Quaternion ZupQuatToYup(Quaternion q)
     {
-        // Swap Y and Z axes: apply a -90 deg rotation around X
-        // For Z-up to Y-up: (x, y, z, w) -> (x, z, -y, w) then adjust
-        // Proper conversion: swap y<->z, negate new z
-        return new Quaternion(q.x, q.z, -q.y, q.w);
+        // Y↔Z swap is an improper transformation (det=-1). To conjugate a rotation
+        // R_zup by swap matrix M: R_yup = M * R_zup * M.  For quaternion (x,y,z,w)
+        // this gives (x, z, y, -w). Note: -q represents the same rotation, so this
+        // is equivalent to (-x, -z, -y, w).
+        return new Quaternion(q.x, q.z, q.y, -q.w);
     }
 
     /// <summary>Y-up Unity Quaternion -> Z-up [x,y,z,w] array</summary>
     static float[] YupQuatToZup(Quaternion q)
     {
-        // Inverse of ZupQuatToYup: (x, y, z, w) -> (x, -z, y, w)
-        return new float[] { q.x, -q.z, q.y, q.w };
+        // Inverse of ZupQuatToYup: same swap (M = M^-1)
+        return new float[] { q.x, q.z, q.y, -q.w };
     }
 
     // ===== Quaternion / Vector Math (Z-up frame, matching web impl) =====
@@ -1420,27 +1421,48 @@ public static class MJCFParser
 
     static void ComputeJointFrame(List<float[]> jointAxes, out float[] q, out int[] axisMap)
     {
-        // Always map axes in natural MJCF order: axis0→twist(X), axis1→swingY, axis2→swingZ.
-        // No axis swapping — since we force axisMap=[0,1,2] for all spherical joints,
-        // the rotation matrix columns must match the MJCF axis order exactly.
+        // Matches the web demo's _computeJointFrame exactly.
+        // PhysX convention: twist=X, swing1=Y, swing2=Z.
+        // The heuristic swaps axes 1↔2 when the second MJCF axis aligns more
+        // with Z than Y, placing it in the swing2(Z) slot. This matches how
+        // the policy was trained via Isaac Lab's PhysX joint setup.
         axisMap = new int[] { 0, 1, 2 };
         int n = jointAxes.Count;
 
         if (n == 0) { q = new float[] { 0, 0, 0, 1 }; return; }
         if (n == 1) { q = GetRotationQuat(new float[] { 1, 0, 0 }, jointAxes[0]); return; }
 
-        float[] a0 = Normalize3(jointAxes[0]);
-        float[] a1 = Normalize3(jointAxes[1]);
+        float[] Q = GetRotationQuat(jointAxes[0], new float[] { 1, 0, 0 });
+        float[] b = Normalize3(QuatRotate3(Q, jointAxes[1]));
 
         if (n == 2)
         {
-            float[] a2 = Normalize3(Cross3(a0, a1));
-            q = Mat33ToQuat(a0, a1, a2);
+            if (Mathf.Abs(Dot3(b, new float[] { 0, 1, 0 })) > Mathf.Abs(Dot3(b, new float[] { 0, 0, 1 })))
+            {
+                axisMap[1] = 1;
+                float[] c = Normalize3(Cross3(jointAxes[0], jointAxes[1]));
+                q = Mat33ToQuat(Normalize3(jointAxes[0]), Normalize3(jointAxes[1]), c);
+            }
+            else
+            {
+                axisMap[1] = 2; axisMap[2] = 1;
+                float[] c = Normalize3(Cross3(jointAxes[1], jointAxes[0]));
+                q = Mat33ToQuat(Normalize3(jointAxes[0]), c, Normalize3(jointAxes[1]));
+            }
             return;
         }
 
-        // n == 3: columns = [axis0, axis1, axis2]
-        q = Mat33ToQuat(a0, a1, Normalize3(jointAxes[2]));
+        // n == 3
+        if (Mathf.Abs(Dot3(b, new float[] { 0, 1, 0 })) > Mathf.Abs(Dot3(b, new float[] { 0, 0, 1 })))
+        {
+            axisMap[1] = 1; axisMap[2] = 2;
+            q = Mat33ToQuat(Normalize3(jointAxes[0]), Normalize3(jointAxes[1]), Normalize3(jointAxes[2]));
+        }
+        else
+        {
+            axisMap[1] = 2; axisMap[2] = 1;
+            q = Mat33ToQuat(Normalize3(jointAxes[0]), Normalize3(jointAxes[2]), Normalize3(jointAxes[1]));
+        }
     }
 
     static float[] GetRotationQuat(float[] from, float[] to)
