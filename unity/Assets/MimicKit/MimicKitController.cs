@@ -256,7 +256,7 @@ public class MimicKitController : MonoBehaviour
                 ab.inertiaTensorRotation = Quaternion.identity;
             }
             if (body.com != null)
-                ab.centerOfMass = new Vector3(body.com[0], body.com[2], body.com[1]);
+                ab.centerOfMass = ZupToYup(body.com);
 
             // Match Isaac Lab rigid body properties
             ab.linearDamping = 0.0f;
@@ -290,9 +290,12 @@ public class MimicKitController : MonoBehaviour
             ab.anchorPosition = Vector3.zero;
             ab.parentAnchorPosition = ZupToYup(jdata.localPos0);
 
-            // Joint frame rotation (Z-up quat [w,x,y,z] -> Y-up)
-            var lr = jdata.localRot; // [w,x,y,z]
-            Quaternion jointFrame = ZupQuatToYup(new Quaternion(lr[1], lr[2], lr[3], lr[0]));
+            // Compute joint frame directly from Y-up axes.
+            // Converting a Z-up joint frame quaternion to Y-up is unreliable because
+            // positions use a -90° rotation (proper) while the parser's joint frame
+            // was built from Z-up axes. Instead, convert each MJCF axis to Y-up
+            // and build the joint frame rotation in Y-up space.
+            Quaternion jointFrame = ComputeJointFrameYup(jdata.axes);
             ab.anchorRotation = jointFrame;
             ab.parentAnchorRotation = jointFrame;
 
@@ -663,25 +666,30 @@ public class MimicKitController : MonoBehaviour
     }
 
     // ===== Coordinate Conversion (Z-up <-> Y-up) =====
+    //
+    // We use a -90° rotation around X (Rx) to convert between Z-up and Y-up.
+    // This is a PROPER rotation (det=+1), preserving handedness.
+    //   Rx maps: X→X, Y→-Z, Z→Y
+    //   Rx⁻¹:   X→X, Y→Z,  Z→-Y
+    //
+    // Positions and quaternions must use the SAME transformation to be consistent.
 
-    static Vector3 ZupToYup(float[] v) => new Vector3(v[0], v[2], v[1]);
-    static float[] YupToZup(Vector3 v) => new float[] { v.x, v.z, v.y };
+    static Vector3 ZupToYup(float[] v) => new Vector3(v[0], v[2], -v[1]);
+    static float[] YupToZup(Vector3 v) => new float[] { v.x, -v.z, v.y };
 
-    /// <summary>Z-up quaternion [x,y,z,w] (Unity Quaternion) -> Y-up Unity Quaternion</summary>
+    /// <summary>Convert Z-up axis vector to Y-up (same rotation, for direction vectors)</summary>
+    static float[] ZupAxisToYup(float[] v) => new float[] { v[0], v[2], -v[1] };
+
+    /// <summary>Z-up quaternion -> Y-up Unity Quaternion via Rx(-90°) conjugation</summary>
     static Quaternion ZupQuatToYup(Quaternion q)
     {
-        // Y↔Z swap is an improper transformation (det=-1). To conjugate a rotation
-        // R_zup by swap matrix M: R_yup = M * R_zup * M.  For quaternion (x,y,z,w)
-        // this gives (x, z, y, -w). Note: -q represents the same rotation, so this
-        // is equivalent to (-x, -z, -y, w).
-        return new Quaternion(q.x, q.z, q.y, -q.w);
+        return new Quaternion(q.x, q.z, -q.y, q.w);
     }
 
-    /// <summary>Y-up Unity Quaternion -> Z-up [x,y,z,w] array</summary>
+    /// <summary>Y-up Unity Quaternion -> Z-up [x,y,z,w] array via Rx(+90°) conjugation</summary>
     static float[] YupQuatToZup(Quaternion q)
     {
-        // Inverse of ZupQuatToYup: same swap (M = M^-1)
-        return new float[] { q.x, q.z, q.y, -q.w };
+        return new float[] { q.x, -q.z, q.y, q.w };
     }
 
     // ===== Quaternion / Vector Math (Z-up frame, matching web impl) =====
@@ -751,6 +759,41 @@ public class MimicKitController : MonoBehaviour
     }
 
     // ===== Helpers =====
+
+    /// <summary>
+    /// Compute the joint frame quaternion in Y-up space directly from MJCF axes.
+    /// Converts each Z-up MJCF axis to Y-up, then builds the rotation matrix.
+    /// This avoids error-prone Z-up quaternion → Y-up quaternion conversion.
+    /// </summary>
+    static Quaternion ComputeJointFrameYup(List<MJCFJointAxis> axes)
+    {
+        int n = axes.Count;
+        if (n == 0) return Quaternion.identity;
+
+        Vector3 a0 = new Vector3(axes[0].mjcf_axis[0], axes[0].mjcf_axis[2], -axes[0].mjcf_axis[1]).normalized;
+
+        if (n == 1)
+        {
+            // Revolute: rotation that maps X (twist axis) to the MJCF axis
+            return Quaternion.FromToRotation(Vector3.right, a0);
+        }
+
+        Vector3 a1 = new Vector3(axes[1].mjcf_axis[0], axes[1].mjcf_axis[2], -axes[1].mjcf_axis[1]).normalized;
+
+        Vector3 a2;
+        if (n >= 3)
+            a2 = new Vector3(axes[2].mjcf_axis[0], axes[2].mjcf_axis[2], -axes[2].mjcf_axis[1]).normalized;
+        else
+            a2 = Vector3.Cross(a0, a1).normalized;
+
+        // Build rotation matrix from column vectors [a0, a1, a2]
+        // This maps: X→a0 (twist), Y→a1 (swingY), Z→a2 (swingZ)
+        Matrix4x4 m = Matrix4x4.identity;
+        m.SetColumn(0, new Vector4(a0.x, a0.y, a0.z, 0));
+        m.SetColumn(1, new Vector4(a1.x, a1.y, a1.z, 0));
+        m.SetColumn(2, new Vector4(a2.x, a2.y, a2.z, 0));
+        return m.rotation;
+    }
 
     static ArticulationDrive GetDrive(ArticulationBody ab, int axis)
     {
