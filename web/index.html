@@ -729,10 +729,7 @@ function buildArticulation() {
     // Isaac Lab: scene maxPositionIterationCount=4, maxVelocityIterationCount=0
     // These scene-level caps override per-articulation requests.
     // PhysX WASM has no scene cap, so we set the effective value directly.
-    // PhysX requires minVelocityIters=1 when set on articulation, but Isaac Lab
-    // effectively runs 0 velocity iterations via the scene cap.
-    // Set 4/1 — the closest we can get (PhysX WASM enforces min 1 vel iter).
-    articulation.setSolverIterationCounts(4, 1);
+    articulation.setSolverIterationCounts(4, 0);
     // Match Isaac Lab: sleep threshold and stabilization threshold
     if (typeof articulation.setSleepThreshold === 'function') {
         articulation.setSleepThreshold(5e-5);
