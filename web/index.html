@@ -41,6 +41,7 @@ canvas { display: block; }
     <div class="title">ASE Humanoid - Sword &amp; Shield</div>
     <div id="fpsDisplay">FPS: --</div>
     <div id="physInfo">PhysX WASM + ONNX Runtime</div>
+    <div id="backendInfo" style="color:#7c83ff;font-weight:600;">Backend: PhysX</div>
 </div>
 
 <!-- ONNX Runtime (loaded globally) -->
@@ -464,6 +465,22 @@ let SHAPE_FLAGS_VAL;
 let groundActor;
 let groundRemoved = false;
 
+// ---------------------------------------------------------------------------
+// Backend selection: 'physx' or 'mujoco'
+// ---------------------------------------------------------------------------
+let activeBackend = 'physx';
+
+// MuJoCo globals
+let mujocoModule = null;  // The loaded mujoco-js WASM module
+let mjModel = null;       // MjModel
+let mjData = null;        // MjData
+let mjBodyNames = [];     // body name -> MuJoCo body index
+let mjBodyMap = {};       // body name -> MuJoCo body index
+let mjActuatorOrder = []; // actuator names in MJCF order
+let mjDofMap = [];        // maps our dofInfo index to MuJoCo actuator ctrl index
+let mjMjcfXml = null;     // cached MJCF XML string
+let mujocoReady = false;
+
 let numSubsteps = 4;  // Must be 4 to match Isaac Lab training (4 × 1/120 = 1/30s per policy step)
 const DT = 1 / 120;
 const CONTROL_DT = 1 / 30;  // Policy trained at 30Hz
@@ -566,10 +583,14 @@ async function loadOnnxModel() {
             if (meta[f] !== undefined) humanoidData[f] = meta[f];
         }
         // If MJCF XML is baked in and we haven't parsed it yet, parse it now
-        if (meta.mjcf_xml && !humanoidData.bodies) {
-            const mjcfData = parseMJCF(meta.mjcf_xml);
-            Object.assign(humanoidData, mjcfData);
-            console.log('Parsed MJCF from ONNX metadata:', humanoidData.bodies.length, 'bodies');
+        if (meta.mjcf_xml) {
+            // Cache raw MJCF XML for MuJoCo backend
+            mjMjcfXml = meta.mjcf_xml;
+            if (!humanoidData.bodies) {
+                const mjcfData = parseMJCF(meta.mjcf_xml);
+                Object.assign(humanoidData, mjcfData);
+                console.log('Parsed MJCF from ONNX metadata:', humanoidData.bodies.length, 'bodies');
+            }
         }
     }
 }
@@ -1033,6 +1054,464 @@ let restoreGroundAfterStep = false;
 function scheduleGroundRestore() { restoreGroundAfterStep = true; }
 
 // ---------------------------------------------------------------------------
+// MuJoCo Backend
+// ---------------------------------------------------------------------------
+async function initMuJoCo() {
+    console.log('Loading MuJoCo WASM (~11MB)...');
+    try {
+        // Dynamic import of mujoco-js from CDN (WASM is embedded in JS)
+        const load_mujoco = (await import('https://cdn.jsdelivr.net/npm/mujoco-js@0.0.7/dist/mujoco_wasm.js')).default;
+        mujocoModule = await load_mujoco();
+        console.log('MuJoCo WASM loaded');
+
+        // Set up virtual filesystem
+        mujocoModule.FS.mkdir('/working');
+        mujocoModule.FS.mount(mujocoModule.MEMFS, { root: '.' }, '/working');
+        mujocoReady = true;
+    } catch(e) {
+        console.warn('MuJoCo WASM failed to load:', e.message);
+        mujocoReady = false;
+    }
+}
+
+function buildMuJoCoModel() {
+    if (!mujocoReady || !mjMjcfXml) {
+        console.error('MuJoCo not ready or no MJCF XML available');
+        return false;
+    }
+
+    // Clean up previous model/data
+    if (mjData) { mjData.delete(); mjData = null; }
+    if (mjModel) { mjModel.delete(); mjModel = null; }
+
+    try {
+        // Inject ground plane, solver options, and convert actuators for MuJoCo
+        let mjcfForMujoco = mjMjcfXml;
+
+        // 1. Add ground plane geom to worldbody
+        const groundGeom = '  <geom name="ground" type="plane" size="50 50 0.1" rgba="0.3 0.3 0.35 1" condim="3" conaffinity="1" contype="1"/>\n';
+        mjcfForMujoco = mjcfForMujoco.replace(
+            /(<worldbody>)/,
+            '$1\n' + groundGeom
+        );
+
+        // 2. Add simulation options (match Newton engine: 240Hz, Newton solver)
+        if (!mjcfForMujoco.includes('<option')) {
+            mjcfForMujoco = mjcfForMujoco.replace(
+                /(<mujoco[^>]*>)/,
+                '$1\n  <option timestep="0.004166667" gravity="0 0 -9.81" iterations="100" solver="Newton" impratio="10"/>'
+            );
+        }
+
+        // 3. Replace <motor> actuators with <general> actuators for position PD control
+        // Newton engine reads dof_passive_stiffness/damping as kp/kd gains.
+        // MuJoCo <general> with gaintype="fixed" biastype="affine":
+        //   force = gain*ctrl + bias[0] + bias[1]*qpos + bias[2]*qvel
+        //   Set gain=kp, bias=[0, -kp, -kd] => force = kp*(ctrl-qpos) - kd*qvel
+        const jointGains = {};
+        if (humanoidData.joints) {
+            for (const jdata of humanoidData.joints) {
+                for (const ax of jdata.axes) {
+                    jointGains[ax.name] = {
+                        kp: ax.stiffness || 200,
+                        kd: ax.damping || 20,
+                        maxForce: ax.maxForce || 200
+                    };
+                }
+            }
+        }
+        console.log('Joint PD gains sample:', Object.keys(jointGains).slice(0,3).map(k => k + ': kp=' + jointGains[k].kp + ' kd=' + jointGains[k].kd));
+
+        // Replace the entire <actuator>...</actuator> section with position-controlled generals
+        const actuatorNames = humanoidData.actuatorOrder || [];
+        if (actuatorNames.length > 0) {
+            let newActuatorSection = '<actuator>\n';
+            for (const actName of actuatorNames) {
+                const gains = jointGains[actName] || { kp: 200, kd: 20 };
+                newActuatorSection += `  <general name="${actName}" joint="${actName}" gainprm="${gains.kp} 0 0" biasprm="0 ${-gains.kp} ${-gains.kd}" biastype="affine" gaintype="fixed"/>\n`;
+            }
+            newActuatorSection += '</actuator>';
+            mjcfForMujoco = mjcfForMujoco.replace(/<actuator>[\s\S]*?<\/actuator>/, newActuatorSection);
+            console.log('Replaced actuator section with', actuatorNames.length, 'general position PD actuators');
+        }
+        console.log('Injected ground plane, solver options, and position actuators into MJCF');
+
+        // Write MJCF XML to virtual filesystem
+        mujocoModule.FS.writeFile('/working/humanoid.xml', mjcfForMujoco);
+
+        // Load model from XML
+        mjModel = mujocoModule.MjModel.loadFromXML('/working/humanoid.xml');
+        mjData = new mujocoModule.MjData(mjModel);
+
+        console.log('MuJoCo model loaded: nq=' + mjModel.nq + ' nv=' + mjModel.nv +
+                    ' nu=' + mjModel.nu + ' nbody=' + mjModel.nbody);
+
+        // Build body name mapping
+        mjBodyNames = [];
+        mjBodyMap = {};
+        const textDecoder = new TextDecoder('utf-8');
+        const namesArray = new Uint8Array(mjModel.names);
+        for (let b = 0; b < mjModel.nbody; b++) {
+            const startIdx = mjModel.name_bodyadr[b];
+            let endIdx = startIdx;
+            while (endIdx < namesArray.length && namesArray[endIdx] !== 0) endIdx++;
+            const name = textDecoder.decode(namesArray.subarray(startIdx, endIdx));
+            mjBodyNames.push(name);
+            mjBodyMap[name] = b;
+        }
+        console.log('MuJoCo bodies:', mjBodyNames);
+
+        // Build actuator name mapping
+        mjActuatorOrder = [];
+        for (let a = 0; a < mjModel.nu; a++) {
+            const startIdx = mjModel.name_actuatoradr[a];
+            let endIdx = startIdx;
+            while (endIdx < namesArray.length && namesArray[endIdx] !== 0) endIdx++;
+            const name = textDecoder.decode(namesArray.subarray(startIdx, endIdx));
+            mjActuatorOrder.push(name);
+        }
+        console.log('MuJoCo actuators:', mjActuatorOrder);
+
+        // Build DOF mapping: map our dofInfo (policy action order) to MuJoCo ctrl indices
+        // The policy outputs actions in actuatorOrder (from MJCF parsing), and MuJoCo
+        // actuators map directly to the MJCF actuator order.
+        mjDofMap = [];
+        if (humanoidData.actuatorOrder) {
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const axisName = humanoidData.dofInfo[i].axis_name;
+                // Find the MuJoCo actuator that drives this joint axis
+                // MuJoCo actuator names typically match joint names or use a naming convention
+                let ctrlIdx = mjActuatorOrder.indexOf(axisName);
+                if (ctrlIdx < 0) {
+                    // Try matching by joint name (actuator may have motor_ prefix or similar)
+                    for (let a = 0; a < mjActuatorOrder.length; a++) {
+                        if (mjActuatorOrder[a].includes(axisName) || axisName.includes(mjActuatorOrder[a])) {
+                            ctrlIdx = a;
+                            break;
+                        }
+                    }
+                }
+                mjDofMap.push(ctrlIdx);
+            }
+        }
+        console.log('DOF->ctrl mapping:', mjDofMap);
+
+        // Log timestep info
+        console.log('MuJoCo model timestep:', mjModel.opt.timestep,
+                    '(our DT=' + DT + ', will step at native MuJoCo rate)');
+
+        // Apply initial pose
+        applyMuJoCoInitPose();
+
+        // Run forward to compute positions
+        mujocoModule.mj_forward(mjModel, mjData);
+
+        return true;
+    } catch(e) {
+        console.error('Failed to build MuJoCo model:', e);
+        return false;
+    }
+}
+
+function applyMuJoCoInitPose() {
+    if (!mjModel || !mjData) return;
+
+    // Reset to default state first
+    mujocoModule.mj_resetData(mjModel, mjData);
+
+    // Set initial root position and orientation
+    if (humanoidData.init_root_pos) {
+        const rp = humanoidData.init_root_pos;
+        const rq = humanoidData.init_root_rot_quat; // [x,y,z,w]
+        // MuJoCo free joint qpos: [x, y, z, qw, qx, qy, qz]
+        mjData.qpos[0] = rp[0];
+        mjData.qpos[1] = rp[1];
+        mjData.qpos[2] = rp[2];
+        if (rq) {
+            mjData.qpos[3] = rq[3]; // w
+            mjData.qpos[4] = rq[0]; // x
+            mjData.qpos[5] = rq[1]; // y
+            mjData.qpos[6] = rq[2]; // z
+        }
+    }
+
+    // Set initial DOF positions
+    // MuJoCo qpos after the free joint (7 values) contains hinge joint angles
+    // in the order they appear in the MJCF
+    if (humanoidData.init_dof_pos && humanoidData.dofInfo) {
+        // Build joint name -> qpos address mapping from MuJoCo model
+        const textDecoder = new TextDecoder('utf-8');
+        const namesArray = new Uint8Array(mjModel.names);
+
+        for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+            const axisName = humanoidData.dofInfo[i].axis_name;
+            // Find the MuJoCo joint with this name
+            for (let j = 0; j < mjModel.njnt; j++) {
+                const startIdx = mjModel.name_jntadr[j];
+                let endIdx = startIdx;
+                while (endIdx < namesArray.length && namesArray[endIdx] !== 0) endIdx++;
+                const jntName = textDecoder.decode(namesArray.subarray(startIdx, endIdx));
+                if (jntName === axisName) {
+                    const qposAddr = mjModel.jnt_qposadr[j];
+                    mjData.qpos[qposAddr] = humanoidData.init_dof_pos[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    // With general position actuators, ctrl = target position
+    // Set ctrl to init DOF positions so PD drives hold the combat stance
+    if (humanoidData.init_dof_pos && mjDofMap) {
+        for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+            const ctrlIdx = mjDofMap[i];
+            if (ctrlIdx >= 0 && ctrlIdx < mjModel.nu) {
+                mjData.ctrl[ctrlIdx] = humanoidData.init_dof_pos[i];
+            }
+        }
+    }
+
+    // Zero velocities
+    for (let i = 0; i < mjModel.nv; i++) mjData.qvel[i] = 0;
+
+    mujocoModule.mj_forward(mjModel, mjData);
+    console.log('Applied MuJoCo init pose: root_z=' + mjData.qpos[2].toFixed(3) + ', nu=' + mjModel.nu);
+}
+
+function resetMuJoCo() {
+    if (!mjModel || !mjData) return;
+    applyMuJoCoInitPose();
+}
+
+// Read MuJoCo state into the format needed for observation building
+function getMuJoCoState() {
+    if (!mjModel || !mjData) return null;
+
+    const nbody = mjModel.nbody;
+    const nv = mjModel.nv;
+
+    // Root body position (body 1 is typically the root/pelvis, body 0 is world)
+    // Find root body index
+    let rootBodyIdx = 1; // Default: first non-world body
+    if (humanoidData.bodies && humanoidData.bodies.length > 0) {
+        const rootName = humanoidData.bodies[0].name;
+        if (mjBodyMap[rootName] !== undefined) rootBodyIdx = mjBodyMap[rootName];
+    }
+
+    // Root position from xpos
+    const rootPos = [
+        mjData.xpos[rootBodyIdx * 3 + 0],
+        mjData.xpos[rootBodyIdx * 3 + 1],
+        mjData.xpos[rootBodyIdx * 3 + 2]
+    ];
+
+    // Root quaternion from xquat [w,x,y,z] -> our [x,y,z,w]
+    const rootRot = [
+        mjData.xquat[rootBodyIdx * 4 + 1],  // x
+        mjData.xquat[rootBodyIdx * 4 + 2],  // y
+        mjData.xquat[rootBodyIdx * 4 + 3],  // z
+        mjData.xquat[rootBodyIdx * 4 + 0]   // w
+    ];
+
+    // Root velocity from qvel (first 6 values for free joint: [vx,vy,vz, wx,wy,wz])
+    const rootVel = [mjData.qvel[0], mjData.qvel[1], mjData.qvel[2]];
+    const rootAngVel = [mjData.qvel[3], mjData.qvel[4], mjData.qvel[5]];
+
+    // DOF positions: read from MuJoCo qpos using joint address mapping
+    const dofPositions = new Float32Array(humanoidData.dofInfo.length);
+    const dofVelocities = new Float32Array(humanoidData.dofInfo.length);
+
+    const textDecoder = new TextDecoder('utf-8');
+    const namesArray = new Uint8Array(mjModel.names);
+
+    // Build joint name -> (qposadr, dofadr) mapping (cache this if perf matters)
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const axisName = humanoidData.dofInfo[i].axis_name;
+        for (let j = 0; j < mjModel.njnt; j++) {
+            const startIdx = mjModel.name_jntadr[j];
+            let endIdx = startIdx;
+            while (endIdx < namesArray.length && namesArray[endIdx] !== 0) endIdx++;
+            const jntName = textDecoder.decode(namesArray.subarray(startIdx, endIdx));
+            if (jntName === axisName) {
+                dofPositions[i] = mjData.qpos[mjModel.jnt_qposadr[j]];
+                dofVelocities[i] = mjData.qvel[mjModel.jnt_dofadr[j]];
+                break;
+            }
+        }
+    }
+
+    // Body positions for FK (read all body xpos)
+    const bodyPos = [];
+    if (humanoidData.bodies) {
+        for (const body of humanoidData.bodies) {
+            const bi = mjBodyMap[body.name];
+            if (bi !== undefined) {
+                bodyPos.push([
+                    mjData.xpos[bi * 3 + 0],
+                    mjData.xpos[bi * 3 + 1],
+                    mjData.xpos[bi * 3 + 2]
+                ]);
+            } else {
+                bodyPos.push([0, 0, 0]);
+            }
+        }
+    }
+
+    return {
+        root_pos: rootPos,
+        root_rot: rootRot,
+        root_vel: rootVel,
+        root_ang_vel: rootAngVel,
+        dof_pos: dofPositions,
+        dof_vel: dofVelocities,
+        body_pos: bodyPos
+    };
+}
+
+// Apply policy actions to MuJoCo general (position PD) actuators
+// ctrl = target position; MuJoCo computes force = kp*(ctrl-qpos) - kd*qvel internally
+function applyMuJoCoActions(action) {
+    if (!mjModel || !mjData || !action) return;
+
+    const aLow = humanoidData.action_low;
+    const aHigh = humanoidData.action_high;
+
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const ctrlIdx = mjDofMap[i];
+        if (ctrlIdx < 0 || ctrlIdx >= mjModel.nu) continue;
+
+        let target = action[i];
+        if (aLow && aHigh) {
+            target = Math.max(aLow[i], Math.min(aHigh[i], target));
+        }
+        mjData.ctrl[ctrlIdx] = target;
+    }
+}
+
+// Update Three.js meshes from MuJoCo body poses
+function updateMeshesMuJoCo() {
+    if (!mjModel || !mjData || !humanoidData.bodies) return;
+    for (let bi = 0; bi < humanoidData.bodies.length; bi++) {
+        const entry = links[bi];
+        if (!entry || !entry.meshGroup) continue;
+        const bodyName = humanoidData.bodies[bi].name;
+        const mjIdx = mjBodyMap[bodyName];
+        if (mjIdx === undefined) continue;
+
+        // Position from xpos (Z-up, matches our worldGroup)
+        const px = mjData.xpos[mjIdx * 3 + 0];
+        const py = mjData.xpos[mjIdx * 3 + 1];
+        const pz = mjData.xpos[mjIdx * 3 + 2];
+        entry.meshGroup.position.set(px, py, pz);
+
+        // Quaternion from xquat [w,x,y,z] -> THREE [x,y,z,w]
+        const qw = mjData.xquat[mjIdx * 4 + 0];
+        const qx = mjData.xquat[mjIdx * 4 + 1];
+        const qy = mjData.xquat[mjIdx * 4 + 2];
+        const qz = mjData.xquat[mjIdx * 4 + 3];
+        entry.meshGroup.quaternion.set(qx, qy, qz, qw);
+    }
+}
+
+// Cache the joint name -> address lookups for MuJoCo observation building
+let mjJointAddrCache = null;
+function buildMjJointAddrCache() {
+    if (!mjModel || !humanoidData.dofInfo) return;
+    mjJointAddrCache = new Array(humanoidData.dofInfo.length);
+    const textDecoder = new TextDecoder('utf-8');
+    const namesArray = new Uint8Array(mjModel.names);
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const axisName = humanoidData.dofInfo[i].axis_name;
+        mjJointAddrCache[i] = { qposAddr: -1, dofAddr: -1 };
+        for (let j = 0; j < mjModel.njnt; j++) {
+            const startIdx = mjModel.name_jntadr[j];
+            let endIdx = startIdx;
+            while (endIdx < namesArray.length && namesArray[endIdx] !== 0) endIdx++;
+            const jntName = textDecoder.decode(namesArray.subarray(startIdx, endIdx));
+            if (jntName === axisName) {
+                mjJointAddrCache[i] = {
+                    qposAddr: mjModel.jnt_qposadr[j],
+                    dofAddr: mjModel.jnt_dofadr[j]
+                };
+                break;
+            }
+        }
+    }
+}
+
+// Fast observation building for MuJoCo (uses cached addresses)
+function buildObservationMuJoCo() {
+    if (!mjJointAddrCache) buildMjJointAddrCache();
+
+    let rootBodyIdx = 1;
+    if (humanoidData.bodies && humanoidData.bodies.length > 0) {
+        const rootName = humanoidData.bodies[0].name;
+        if (mjBodyMap[rootName] !== undefined) rootBodyIdx = mjBodyMap[rootName];
+    }
+
+    const rootPos = [
+        mjData.xpos[rootBodyIdx * 3], mjData.xpos[rootBodyIdx * 3 + 1], mjData.xpos[rootBodyIdx * 3 + 2]
+    ];
+    const rootRot = [
+        mjData.xquat[rootBodyIdx * 4 + 1], mjData.xquat[rootBodyIdx * 4 + 2],
+        mjData.xquat[rootBodyIdx * 4 + 3], mjData.xquat[rootBodyIdx * 4 + 0]
+    ];
+    const rootVel = [mjData.qvel[0], mjData.qvel[1], mjData.qvel[2]];
+    const rootAngVel = [mjData.qvel[3], mjData.qvel[4], mjData.qvel[5]];
+
+    const dofPos = new Float32Array(humanoidData.dofInfo.length);
+    const dofVel = new Float32Array(humanoidData.dofInfo.length);
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const addr = mjJointAddrCache[i];
+        if (addr.qposAddr >= 0) dofPos[i] = mjData.qpos[addr.qposAddr];
+        if (addr.dofAddr >= 0) dofVel[i] = mjData.qvel[addr.dofAddr];
+    }
+
+    return buildObservationFromState({
+        root_pos: rootPos, root_rot: rootRot,
+        root_vel: rootVel, root_ang_vel: rootAngVel,
+        dof_pos: dofPos, dof_vel: dofVel, body_pos: []
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Backend switching
+// ---------------------------------------------------------------------------
+function switchBackend(newBackend) {
+    if (newBackend === activeBackend) return;
+
+    if (newBackend === 'mujoco') {
+        if (!mujocoReady) {
+            console.error('MuJoCo not available');
+            return;
+        }
+        // Rebuild MuJoCo model with current MJCF
+        if (!mjModel) {
+            if (!buildMuJoCoModel()) return;
+        } else {
+            resetMuJoCo();
+        }
+        activeBackend = 'mujoco';
+        document.getElementById('backendInfo').textContent = 'Backend: MuJoCo';
+        document.getElementById('physInfo').textContent = 'MuJoCo WASM + ONNX Runtime';
+        console.log('Switched to MuJoCo backend');
+    } else {
+        activeBackend = 'physx';
+        document.getElementById('backendInfo').textContent = 'Backend: PhysX';
+        document.getElementById('physInfo').textContent = 'PhysX WASM + ONNX Runtime';
+        // Reset PhysX state
+        resetHumanoid();
+        console.log('Switched to PhysX backend');
+    }
+
+    // Reset policy state
+    prevAction = null;
+    currentAction = null;
+    randomLatent();
+    resetGraceFrames = RESET_GRACE;
+}
+
+// ---------------------------------------------------------------------------
 // Debug helpers
 // ---------------------------------------------------------------------------
 function applyDriveParams() {
@@ -1106,6 +1585,31 @@ function updateDebugInfo() {
     } catch(e) {
         // Silently skip if articulation not ready
     }
+}
+
+function updateDebugInfoMuJoCo() {
+    if (!mjModel || !mjData) return;
+    try {
+        let rootIdx = 1;
+        if (humanoidData.bodies && mjBodyMap[humanoidData.bodies[0].name] !== undefined)
+            rootIdx = mjBodyMap[humanoidData.bodies[0].name];
+        const rootZ = mjData.xpos[rootIdx * 3 + 2];
+        const vx = mjData.qvel[0], vy = mjData.qvel[1], vz = mjData.qvel[2];
+        const speed = Math.sqrt(vx*vx + vy*vy + vz*vz);
+
+        let maxDofVel = 0;
+        // Skip first 6 qvel entries (free joint)
+        for (let i = 6; i < mjModel.nv; i++) {
+            const v = Math.abs(mjData.qvel[i]);
+            if (v > maxDofVel) maxDofVel = v;
+        }
+
+        if (window._guiStats) {
+            window._guiStats.root_z = +rootZ.toFixed(3);
+            window._guiStats.root_speed = +speed.toFixed(3);
+            window._guiStats.max_dof_vel = +maxDofVel.toFixed(1);
+        }
+    } catch(e) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1844,56 +2348,115 @@ async function mainLoop(timestamp) {
     // Run as many physics substeps as real time allows (at 120Hz sim rate)
     const maxSubstepsPerFrame = 8; // cap to prevent spiral of death
     let stepsThisFrame = 0;
-    while (window._simAccum >= DT && stepsThisFrame < maxSubstepsPerFrame) {
-        window._simAccum -= DT;
-        stepsThisFrame++;
 
-        // Every numSubsteps physics steps = one policy step (default 4 = 30Hz)
-        if (!window._physStepCount) window._physStepCount = 0;
-        window._physStepCount++;
+    if (activeBackend === 'mujoco' && mjModel && mjData) {
+        // ── MuJoCo backend ──
+        // MuJoCo uses its own timestep from model.opt.timestep
+        const mjDT = mjModel.opt.timestep;
+        // Compute how many MuJoCo steps per policy step to match ~30Hz policy rate
+        const mjStepsPerPolicy = Math.max(1, Math.round(CONTROL_DT / mjDT));
 
-        if (window._physStepCount >= numSubsteps) {
-            window._physStepCount = 0;
+        while (window._simAccum >= mjDT && stepsThisFrame < maxSubstepsPerFrame * 4) {
+            window._simAccum -= mjDT;
+            stepsThisFrame++;
 
-            slerpLatent();
+            if (!window._physStepCount) window._physStepCount = 0;
+            window._physStepCount++;
 
-            // Run policy
-            if (policyEnabled) {
-                try {
-                    const obs = buildObservation();
-                    currentAction = await runPolicy(obs);
-                    if (currentAction) applyActions(currentAction);
-                } catch (e) {
-                    if (!window._policyErrCount) window._policyErrCount = 0;
-                    if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
-                    if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+            if (window._physStepCount >= mjStepsPerPolicy) {
+                window._physStepCount = 0;
+                slerpLatent();
+
+                if (policyEnabled) {
+                    try {
+                        const obs = buildObservationMuJoCo();
+                        currentAction = await runPolicy(obs);
+                        if (currentAction) applyMuJoCoActions(currentAction);
+                    } catch (e) {
+                        if (!window._policyErrCount) window._policyErrCount = 0;
+                        if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
+                        if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+                    }
                 }
-            } else {
-                applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
             }
+
+            // MuJoCo physics substep
+            mujocoModule.mj_step(mjModel, mjData);
         }
 
-        // Physics substep
-        pxScene.simulate(DT);
-        pxScene.fetchResults(true);
-        if (restoreGroundAfterStep) { restoreGround(); restoreGroundAfterStep = false; }
+        // Auto-reset if MuJoCo explodes
+        try {
+            let rootIdx = 1;
+            if (humanoidData.bodies && mjBodyMap[humanoidData.bodies[0].name] !== undefined)
+                rootIdx = mjBodyMap[humanoidData.bodies[0].name];
+            const rz = mjData.xpos[rootIdx * 3 + 2];
+            if (resetGraceFrames > 0) resetGraceFrames--;
+            else if (isNaN(rz) || Math.abs(rz) > 50) { resetMuJoCo(); resetGraceFrames = RESET_GRACE; }
+        } catch(e) {}
+
+        // Camera tracking (MuJoCo)
+        {
+            let rootIdx = 1;
+            if (humanoidData.bodies && mjBodyMap[humanoidData.bodies[0].name] !== undefined)
+                rootIdx = mjBodyMap[humanoidData.bodies[0].name];
+            const rx = mjData.xpos[rootIdx * 3 + 0];
+            const ry = mjData.xpos[rootIdx * 3 + 1];
+            const rz = mjData.xpos[rootIdx * 3 + 2];
+            controls.target.lerp(new THREE.Vector3(rx, Math.max(rz, 0.5), -ry), 0.05);
+        }
+
+        updateMeshesMuJoCo();
+        updateDebugInfoMuJoCo();
+
+    } else {
+        // ── PhysX backend ──
+        while (window._simAccum >= DT && stepsThisFrame < maxSubstepsPerFrame) {
+            window._simAccum -= DT;
+            stepsThisFrame++;
+
+            if (!window._physStepCount) window._physStepCount = 0;
+            window._physStepCount++;
+
+            if (window._physStepCount >= numSubsteps) {
+                window._physStepCount = 0;
+                slerpLatent();
+
+                if (policyEnabled) {
+                    try {
+                        const obs = buildObservation();
+                        currentAction = await runPolicy(obs);
+                        if (currentAction) applyActions(currentAction);
+                    } catch (e) {
+                        if (!window._policyErrCount) window._policyErrCount = 0;
+                        if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
+                        if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+                    }
+                } else {
+                    applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
+                }
+            }
+
+            pxScene.simulate(DT);
+            pxScene.fetchResults(true);
+            if (restoreGroundAfterStep) { restoreGround(); restoreGroundAfterStep = false; }
+        }
+
+        // Auto-reset if physics explodes
+        try {
+            const rz = links[0].link.getGlobalPose().get_p().get_z();
+            if (resetGraceFrames > 0) resetGraceFrames--;
+            else if (isNaN(rz) || Math.abs(rz) > 50) { resetHumanoid(); resetGraceFrames = RESET_GRACE; }
+        } catch(e) {}
+
+        // Camera tracking (PhysX)
+        {
+            const rp = links[0].link.getGlobalPose().get_p();
+            controls.target.lerp(new THREE.Vector3(rp.get_x(), Math.max(rp.get_z(), 0.5), -rp.get_y()), 0.05);
+        }
+
+        updateMeshes();
+        updateDebugInfo();
     }
-
-    // Auto-reset if physics explodes
-    try {
-        const rz = links[0].link.getGlobalPose().get_p().get_z();
-        if (resetGraceFrames > 0) resetGraceFrames--;
-        else if (isNaN(rz) || Math.abs(rz) > 50) { resetHumanoid(); resetGraceFrames = RESET_GRACE; }
-    } catch(e) {}
-
-    // Camera tracking
-    {
-        const rp = links[0].link.getGlobalPose().get_p();
-        controls.target.lerp(new THREE.Vector3(rp.get_x(), Math.max(rp.get_z(), 0.5), -rp.get_y()), 0.05);
-    }
-
-    updateMeshes();
-    updateDebugInfo();
     controls.update();
     renderer.render(scene3d, camera);
     requestAnimationFrame(mainLoop);
@@ -1904,13 +2467,18 @@ async function mainLoop(timestamp) {
 // ---------------------------------------------------------------------------
 async function init() {
     try {
-        // Load ONNX first (extracts baked metadata including MJCF + config)
-        // then load any missing data from external MJCF/JSON files
-        await Promise.all([loadOnnxModel(), initPhysX()]);
+        // Load ONNX, PhysX, and MuJoCo in parallel
+        // ONNX extracts baked metadata including MJCF + config
+        await Promise.all([loadOnnxModel(), initPhysX(), initMuJoCo()]);
         await loadHumanoidData();
 
         setStatus('Building humanoid...');
         buildArticulation();
+
+        // Also pre-build MuJoCo model if available
+        if (mujocoReady && mjMjcfXml) {
+            buildMuJoCoModel();
+        }
 
         initThreeJS();
         randomLatent();
@@ -1920,9 +2488,20 @@ async function init() {
         // Build lil-gui panel
         const gui = new GUI({ title: 'MimicKit' });
 
+        // Backend folder
+        const backendFolder = gui.addFolder('Backend');
+        const backendParams = { engine: activeBackend };
+        const engineOptions = { 'PhysX': 'physx' };
+        if (mujocoReady) engineOptions['MuJoCo'] = 'mujoco';
+        backendFolder.add(backendParams, 'engine', engineOptions).name('Physics Engine').onChange(v => {
+            switchBackend(v);
+        });
+
         // Actions folder
         const actionsFolder = gui.addFolder('Actions');
-        actionsFolder.add({ reset: resetHumanoid }, 'reset').name('Reset');
+        actionsFolder.add({ reset: () => {
+            if (activeBackend === 'mujoco') { resetMuJoCo(); } else { resetHumanoid(); }
+        }}, 'reset').name('Reset');
 
         // Skills folder — hand-derived latent presets
         const skillFolder = gui.addFolder('Skills');
