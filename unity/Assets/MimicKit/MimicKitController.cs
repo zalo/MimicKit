@@ -468,7 +468,7 @@ public class MimicKitController : MonoBehaviour
         float[] rootPos = YupToZup(rootPosYup);
         float[] rootRot = YupQuatToZup(rootRotYup); // [x,y,z,w]
 
-        Vector3 rvYup = rootBody.velocity;
+        Vector3 rvYup = rootBody.linearVelocity;
         float[] rootVel = YupToZup(rvYup);
         Vector3 rawYup = rootBody.angularVelocity;
         float[] rootAngVel = YupToZup(rawYup);
