@@ -329,36 +329,44 @@ def export_single(arg_file, model_file, output_path, model_basename=None):
     char_file = env_config.get('char_file')
     init_pose = env_config.get('init_pose')
     global_obs = env_config.get('global_obs', False)
+    root_height_obs = env_config.get('root_height_obs', True)
     key_bodies = env_config.get('key_bodies', [])
+    env_name = env_config.get('env_name', '')
+    enable_tar_obs = env_config.get('enable_tar_obs', False)
+    tar_obs_steps = env_config.get('tar_obs_steps', [])
 
     if init_pose and isinstance(init_pose, list) and len(init_pose) > 6:
         # MimicKit init_pose format: [x, y, z, exp_x, exp_y, exp_z, dof0, dof1, ...]
         # [0:3] = root position, [3:6] = root rotation as exp map, [6:] = joint DOFs
         meta['init_root_pos'] = init_pose[:3]
-        # Convert exp map to quaternion
         exp_map = init_pose[3:6]
         meta['init_root_rot_quat'] = _exp_map_to_quat(exp_map)
         meta['init_dof_pos'] = init_pose[6:]
 
+    # Obs pipeline configuration
     meta['global_obs'] = bool(global_obs)
+    meta['root_height_obs'] = bool(root_height_obs)
+    meta['env_name'] = env_name
+    meta['enable_tar_obs'] = bool(enable_tar_obs)
+    if enable_tar_obs and tar_obs_steps:
+        meta['tar_obs_steps'] = tar_obs_steps
 
-    # Bake MJCF XML
+    # Bake MJCF XML and count bodies
+    body_names = []
     if char_file and os.path.isfile(char_file):
         with open(char_file) as f:
             meta['mjcf_xml'] = f.read()
-        print(f"  Baked MJCF from {char_file} ({len(meta['mjcf_xml'])} chars)")
+        body_names = _extract_body_names(char_file)
+        meta['num_bodies'] = len(body_names)
+        print(f"  Baked MJCF from {char_file} ({len(meta['mjcf_xml'])} chars, {len(body_names)} bodies)")
 
     # Compute pelvis_z and tpose_pelvis_z from init_pose
     if init_pose and len(init_pose) >= 3:
         meta['pelvis_z'] = float(init_pose[2])
-        # T-pose pelvis is typically ~0.2m higher than init pose for humanoid characters
-        # This is used for positioning during articulation construction
         meta['tpose_pelvis_z'] = float(init_pose[2]) + 0.2
 
-    # For key_body_ids, we need to map body names to indices from the MJCF
-    # This requires parsing the MJCF to get body order
-    if char_file and os.path.isfile(char_file) and key_bodies:
-        body_names = _extract_body_names(char_file)
+    # Key body IDs and names
+    if body_names and key_bodies:
         key_ids = []
         for name in key_bodies:
             if name in body_names:
@@ -367,6 +375,60 @@ def export_single(arg_file, model_file, output_path, model_basename=None):
                 print(f"  WARNING: key body '{name}' not found in MJCF")
         if key_ids:
             meta['key_body_ids'] = key_ids
+    meta['key_body_names'] = key_bodies
+
+    # Compute and bake action bounds (matches _build_action_bounds_pos)
+    zero_center_action = env_config.get('zero_center_action', False)
+    meta['zero_center_action'] = bool(zero_center_action)
+    if char_file and os.path.isfile(char_file):
+        a_low, a_high = _compute_action_bounds(char_file, zero_center_action)
+        if len(a_low) == act_dim:
+            meta['action_low'] = a_low
+            meta['action_high'] = a_high
+            print(f"  Baked action bounds: [{min(a_low):.3f}, {max(a_high):.3f}] (zero_center={zero_center_action})")
+        else:
+            print(f"  WARNING: action bounds dim mismatch: {len(a_low)} != {act_dim}")
+
+    # Compute reference FK from init pose for web demo validation
+    if char_file and os.path.isfile(char_file) and init_pose and len(init_pose) > 6:
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mimickit'))
+            from anim.mjcf_char_model import MJCFCharModel
+            from util import torch_util as tu
+            import torch as _torch
+
+            kcm = MJCFCharModel('cpu')
+            kcm.load(char_file)
+            ip = _torch.tensor(init_pose, dtype=_torch.float32)
+            rp = ip[0:3].unsqueeze(0)
+            rr = tu.exp_map_to_quat(ip[3:6].unsqueeze(0))
+            dp = ip[6:].unsqueeze(0)
+            jr = kcm.dof_to_rot(dp)
+            bpos, brot = kcm.forward_kinematics(rp, rr, jr)
+            ref_pos = bpos[0].tolist()  # list of [x,y,z] per body
+            ref_rot = brot[0].tolist()  # list of [x,y,z,w] per body
+            meta['ref_body_pos'] = ref_pos
+            meta['ref_body_rot'] = ref_rot
+            print(f"  Baked reference FK: {len(ref_pos)} body positions")
+        except Exception as e:
+            print(f"  WARNING: Could not compute reference FK: {e}")
+
+    # Verify obs_dim formula for debugging
+    if body_names and meta.get('init_dof_pos') is not None:
+        nb = len(body_names)
+        nj = nb - 1
+        dofs = len(meta['init_dof_pos'])
+        nk = len(meta.get('key_body_ids', []))
+        char_obs_dim = (1 if root_height_obs else 0) + 6 + 3 + 3 + nj*6 + dofs + nk*3
+        tar_obs_dim = 0
+        if enable_tar_obs and tar_obs_steps:
+            per_step = 3 + 6 + nj*6 + nk*3
+            tar_obs_dim = per_step * len(tar_obs_steps)
+        task_dims = {'task_location': 2, 'task_steering': 5}.get(env_name, 0)
+        calc_total = char_obs_dim + tar_obs_dim + task_dims
+        print(f"  Obs formula: char={char_obs_dim} + tar={tar_obs_dim} + task={task_dims} = {calc_total} (actual={obs_dim})")
+        if calc_total != obs_dim:
+            print(f"  WARNING: Obs dim mismatch! calc={calc_total} != actual={obs_dim}")
 
     # Write metadata
     sentinel_key = 'mimickit_config'
@@ -389,6 +451,71 @@ def export_single(arg_file, model_file, output_path, model_basename=None):
     print(f"  Output: {output_path} ({size_mb:.1f} MB)")
     print(f"  Metadata: {len(meta)} keys ({len(config_json)} bytes)")
     return meta
+
+
+def _compute_action_bounds(mjcf_path, zero_center_action=False):
+    """Compute action bounds from MJCF joint limits.
+
+    Matches char_env._build_action_bounds_pos() exactly.
+    Returns (action_low, action_high) as flat lists.
+    """
+    import math
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(mjcf_path)
+    root = tree.getroot()
+    worldbody = root.find('worldbody')
+
+    action_low = []
+    action_high = []
+
+    def visit(elem, is_root=False):
+        if not is_root:
+            joints = [j for j in elem.findall('joint') if j.tag == 'joint']
+            n_joints = len(joints)
+
+            if n_joints == 3:
+                # Spherical: exp_map bounds
+                max_range = 0.0
+                for j in joints:
+                    r = j.get('range')
+                    if r:
+                        parts = [float(x) for x in r.split()]
+                        max_range = max(max_range, abs(parts[0]), abs(parts[1]))
+                curr_scale = 1.2 * max_range
+                for _ in range(3):
+                    action_low.append(-curr_scale)
+                    action_high.append(curr_scale)
+            elif n_joints == 1:
+                # Revolute
+                j = joints[0]
+                r = j.get('range')
+                if r:
+                    parts = [float(x) for x in r.split()]
+                    j_low, j_high = parts[0], parts[1]
+                else:
+                    j_low, j_high = -math.pi, math.pi
+
+                if zero_center_action:
+                    curr_mid = 0.0
+                else:
+                    curr_mid = 0.5 * (j_high + j_low)
+
+                diff_high = abs(j_high - curr_mid)
+                diff_low = abs(j_low - curr_mid)
+                curr_scale = max(diff_high, diff_low) * 1.4
+
+                action_low.append(curr_mid - curr_scale)
+                action_high.append(curr_mid + curr_scale)
+            # else: fixed body, no DOFs
+
+        for child in elem.findall('body'):
+            visit(child, False)
+
+    pelvis = worldbody.find('body')
+    visit(pelvis, True)
+
+    return action_low, action_high
 
 
 def _extract_body_names(mjcf_path):

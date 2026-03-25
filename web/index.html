@@ -376,6 +376,7 @@ function parseMJCF(xmlText, opts = {}) {
     const pelvisPos = _parseVec(pelvis.getAttribute('pos'), 3) || [0,0,0];
     processBody(pelvis, null, pelvisPos);
 
+    // dofInfo: actuator order — used for action application (policy output → PhysX drives)
     const dofInfo = [];
     for (const actName of actuatorOrder) {
         for (const jdata of joints) {
@@ -390,6 +391,11 @@ function parseMJCF(xmlText, opts = {}) {
             }
         }
     }
+
+    // dofInfoDFS: DFS body order — used for observations, init_dof_pos, and forward kinematics.
+    // MimicKit's kin_char_model assigns DOF indices in body DFS order, which differs from
+    // actuator order for characters like Go2 (FR vs FL first) and humanoid (hip_y vs hip_z).
+    const dofInfoDFS = [];
 
     const bodyNames = bodies.map(b => b.name);
     const fk_parent_indices = bodies.map(b => b.parent === null ? -1 : bodyNames.indexOf(b.parent));
@@ -410,6 +416,13 @@ function parseMJCF(xmlText, opts = {}) {
                 dof_idx: dofIdx, dof_dim: nDofs,
                 axis: nDofs === 1 ? jdata.axes[0].mjcf_axis : undefined,
             });
+            // Build dofInfoDFS entries for this joint's DOFs
+            for (let ai = 0; ai < nDofs; ai++) {
+                dofInfoDFS.push({
+                    joint_name: jdata.name, axis_name: jdata.axes[ai].name,
+                    physx_axis: jdata.axisMap[ai], child_body: jdata.child_body,
+                });
+            }
             dofIdx += nDofs;
         } else if (fjdata) {
             kinematicJoints.push({ name: fjdata.name, child_body: bname, type: 'FIXED', dof_idx: dofIdx, dof_dim: 0 });
@@ -418,8 +431,22 @@ function parseMJCF(xmlText, opts = {}) {
         }
     }
 
+    // Build actuator→DFS reorder map: actToDfs[actuator_idx] = dfs_idx
+    // This maps policy action output (actuator order) to DFS DOF order.
+    const actToDfs = new Array(actuatorOrder.length);
+    const dfsToAct = new Array(dofInfoDFS.length);
+    for (let ai = 0; ai < dofInfo.length; ai++) {
+        const actName = dofInfo[ai].axis_name;
+        const di = dofInfoDFS.findIndex(d => d.axis_name === actName);
+        if (di >= 0) {
+            actToDfs[ai] = di;
+            dfsToAct[di] = ai;
+        }
+    }
+
     return {
-        bodies, joints, fixedJoints, actuatorOrder, dofInfo,
+        bodies, joints, fixedJoints, actuatorOrder, dofInfo, dofInfoDFS,
+        actToDfs, dfsToAct,
         fk_parent_indices, fk_local_translations, fk_local_rotations,
         kinematicJoints,
         act_dim: actuatorOrder.length,
@@ -573,7 +600,9 @@ async function loadOnnxModel(onnxFile) {
     if (meta) {
         const fields = ['agent_type','obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
                         'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
-                        'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z','model_name','display_name'];
+                        'key_body_ids','key_body_names','global_obs','root_height_obs','pelvis_z','tpose_pelvis_z',
+                        'model_name','display_name','env_name','enable_tar_obs','tar_obs_steps','num_bodies',
+                        'ref_body_pos','ref_body_rot'];
         for (const f of fields) {
             if (meta[f] !== undefined) humanoidData[f] = meta[f];
         }
@@ -909,24 +938,46 @@ function buildArticulation() {
             joint.setMaxJointVelocity(1000000);
         }
 
-        // Joint frame poses - localPos0 and localRot are Z-up, use directly
+        // Compute joint frame directly from MJCF axes (robust approach from Unity).
+        // Instead of using the parser's heuristic axis-swapping, build the rotation
+        // matrix directly: col0=axis0(twist), col1=axis1(swing1), col2=axis2(swing2).
+        // This avoids the fragile Y-vs-Z proximity heuristic that causes crossed legs.
         const lp = jdata.localPos0;
-        const lr = jdata.localRot; // [w, x, y, z]
+        let jfQ; // joint frame quaternion [x,y,z,w]
+        if (jdata.axes.length === 1) {
+            // Revolute: rotation mapping X (twist) to the MJCF axis
+            jfQ = _getRotationQuat([1,0,0], jdata.axes[0].mjcf_axis);
+        } else if (jdata.axes.length >= 2) {
+            // Spherical: build rotation from axis columns directly
+            const a0 = _normalize(jdata.axes[0].mjcf_axis);
+            const a1 = _normalize(jdata.axes[1].mjcf_axis);
+            const a2 = jdata.axes.length >= 3
+                ? _normalize(jdata.axes[2].mjcf_axis)
+                : _normalize(_cross(a0, a1));
+            jfQ = _mat33ToQuat([a0, a1, a2]);
+        } else {
+            jfQ = [0, 0, 0, 1]; // identity
+        }
+        // Force consecutive axis mapping (no swapping)
+        jdata.axisMap = [0, 1, 2];
+        const lr_wxyz = [jfQ[3], jfQ[0], jfQ[1], jfQ[2]]; // convert xyzw -> wxyz for storage
 
+        // Both parent and child get the same joint frame rotation.
+        // At DOF=0, parent and child frames align → child is in MJCF rest pose.
         const parentPose = new PhysX.PxTransform(
             new PhysX.PxVec3(lp[0], lp[1], lp[2]),
-            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])  // PxQuat(x,y,z,w)
+            new PhysX.PxQuat(jfQ[0], jfQ[1], jfQ[2], jfQ[3])
         );
         const childPose = new PhysX.PxTransform(
             new PhysX.PxVec3(0, 0, 0),
-            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])
+            new PhysX.PxQuat(jfQ[0], jfQ[1], jfQ[2], jfQ[3])
         );
         joint.setParentPose(parentPose);
         joint.setChildPose(childPose);
 
         if (jdata.jointType === 'spherical') {
             for (let i = 0; i < jdata.axes.length; i++) {
-                const physAxis = jdata.axisMap[i];
+                const physAxis = i;  // consecutive: 0=twist, 1=swing1, 2=swing2
                 const axE = axisEnums[physAxis];
                 joint.setMotion(axE, E_LIMITED);
                 const ax = jdata.axes[i];
@@ -1000,11 +1051,13 @@ function applyInitPose() {
     articulation.setRootGlobalPose(new PhysX.PxTransform(
         new PhysX.PxVec3(rp[0], rp[1], rp[2]),
         new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])), true);
+    // Apply init DOFs using DFS body order (matches how init_dof_pos is stored)
     const axisEnumsInit = [E_TWIST, E_SWING1, E_SWING2];
     const bodyLinkMapInit = {};
     for (const l of links) bodyLinkMapInit[l.name] = l.link;
-    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
-        const dof = humanoidData.dofInfo[i];
+    const dofsDFS = humanoidData.dofInfoDFS || humanoidData.dofInfo;
+    for (let i = 0; i < dofsDFS.length && i < initDof.length; i++) {
+        const dof = dofsDFS[i];
         const cl = bodyLinkMapInit[dof.child_body];
         if (!cl) continue;
         try {
@@ -1020,12 +1073,12 @@ function applyInitPose() {
     articulation.applyCache(initCache, initFlags, true);
     restoreGround();
 
-    // Also set drive targets to init pose
+    // Also set drive targets to init pose (DFS order matches init_dof_pos)
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
     const bodyLinkMap = {};
     for (const l of links) bodyLinkMap[l.name] = l.link;
-    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
-        const dof = humanoidData.dofInfo[i];
+    for (let i = 0; i < dofsDFS.length && i < initDof.length; i++) {
+        const dof = dofsDFS[i];
         const childLink = bodyLinkMap[dof.child_body];
         if (!childLink) continue;
         try {
@@ -1034,6 +1087,74 @@ function applyInitPose() {
     }
 
     console.log('Applied init_pose via cache FK: root_z=' + rp[2] + ', dofs=' + initDof.length);
+
+    // Validate: compare JS FK against Python reference FK
+    validateFK();
+}
+
+function validateFK() {
+    const refPos = humanoidData.ref_body_pos;
+    const refRot = humanoidData.ref_body_rot;
+    if (!refPos || !refRot || !humanoidData.fk_parent_indices) return;
+
+    // Compute JS-side FK from init pose
+    const initDof = humanoidData.init_dof_pos;
+    const initRootPos = humanoidData.init_root_pos || [0, 0, 0.9];
+    const initRootRot = humanoidData.init_root_rot_quat || [0, 0, 0, 1];
+    const jq = dofToJointQuats(initDof);
+    const fk = computeFK(initRootPos, initRootRot, jq);
+
+    let maxPosDiff = 0, maxRotDiff = 0, worstBody = '';
+    for (let bi = 0; bi < Math.min(refPos.length, fk.pos.length); bi++) {
+        const rp = refPos[bi], fp = fk.pos[bi];
+        const dx = rp[0]-fp[0], dy = rp[1]-fp[1], dz = rp[2]-fp[2];
+        const posDiff = Math.sqrt(dx*dx+dy*dy+dz*dz);
+
+        const rr = refRot[bi], fr = fk.rot[bi];
+        // Quaternion distance: 1 - |dot|
+        const dot = Math.abs(rr[0]*fr[0] + rr[1]*fr[1] + rr[2]*fr[2] + rr[3]*fr[3]);
+        const rotDiff = 1 - Math.min(dot, 1);
+
+        if (posDiff > 0.01 || rotDiff > 0.01) {
+            const bname = humanoidData.bodies[bi]?.name || `body${bi}`;
+            console.warn(`FK mismatch body[${bi}] ${bname}: pos_err=${posDiff.toFixed(4)} rot_err=${rotDiff.toFixed(4)}`
+                + `\n  ref_pos=[${rp.map(v=>v.toFixed(4))}] js_pos=[${fp.map(v=>v.toFixed(4))}]`
+                + `\n  ref_rot=[${rr.map(v=>v.toFixed(4))}] js_rot=[${fr.map(v=>v.toFixed(4))}]`);
+        }
+        if (posDiff > maxPosDiff) { maxPosDiff = posDiff; worstBody = humanoidData.bodies[bi]?.name || `body${bi}`; }
+        if (rotDiff > maxRotDiff) maxRotDiff = rotDiff;
+    }
+    console.log(`FK validation: max_pos_err=${maxPosDiff.toFixed(4)} (${worstBody}), max_rot_err=${maxRotDiff.toFixed(4)}`);
+
+    // Expose for Playwright testing
+    window._fkValidation = { maxPosDiff, maxRotDiff, worstBody };
+
+    // Compare PhysX link poses against reference (captured before any sim steps)
+    console.log('--- PhysX link poses vs reference (at init, before sim) ---');
+    const phxResults = [];
+    for (let bi = 0; bi < Math.min(refPos.length, links.length); bi++) {
+        const pose = links[bi].link.getGlobalPose();
+        const pp = pose.get_p(), pq = pose.get_q();
+        const px = [pp.get_x(), pp.get_y(), pp.get_z()];
+        const pr = [pq.get_x(), pq.get_y(), pq.get_z(), pq.get_w()];
+        const rp = refPos[bi], rr = refRot[bi];
+        const dx = rp[0]-px[0], dy = rp[1]-px[1], dz = rp[2]-px[2];
+        const posDiff = Math.sqrt(dx*dx+dy*dy+dz*dz);
+        const dot = Math.abs(rr[0]*pr[0] + rr[1]*pr[1] + rr[2]*pr[2] + rr[3]*pr[3]);
+        const rotDiff = 1 - Math.min(dot, 1);
+        const bname = humanoidData.bodies[bi]?.name || `body${bi}`;
+        phxResults.push({ bi, bname, posDiff, rotDiff, rp, px, rr, pr });
+        if (posDiff > 0.01 || rotDiff > 0.01) {
+            console.warn(`PhysX mismatch body[${bi}] ${bname}: pos_err=${posDiff.toFixed(4)} rot_err=${rotDiff.toFixed(4)}`
+                + `\n  ref_pos=[${rp.map(v=>v.toFixed(4))}] phx_pos=[${px.map(v=>v.toFixed(4))}]`
+                + `\n  ref_rot=[${rr.map(v=>v.toFixed(4))}] phx_rot=[${pr.map(v=>v.toFixed(4))}]`);
+        }
+    }
+    const phxMaxPos = Math.max(...phxResults.map(r => r.posDiff));
+    const phxMaxRot = Math.max(...phxResults.map(r => r.rotDiff));
+    const phxWorst = phxResults.reduce((a, b) => a.posDiff > b.posDiff ? a : b);
+    console.log(`PhysX validation: max_pos_err=${phxMaxPos.toFixed(4)} (${phxWorst.bname}), max_rot_err=${phxMaxRot.toFixed(4)}`);
+    window._phxValidation = { phxMaxPos, phxMaxRot, phxWorst: phxWorst.bname, results: phxResults };
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,112 +1418,165 @@ function quatToTanNorm(q) {
 }
 
 // ---------------------------------------------------------------------------
-// Build observation vector - matches Python compute_char_obs exactly.
-//
-// Format (158 dims total):
-//   root_height              (1)   - root Z in Z-up frame
-//   root_rot_tan_norm        (6)   - local root rotation as tan_norm (heading removed)
-//   root_vel                 (3)   - root linear velocity in heading frame
-//   root_ang_vel             (3)   - root angular velocity in heading frame
-//   joint_rot_tan_norm       (96)  - 16 joints * 6 (quaternion -> tan_norm)
-//   dof_vel                  (31)  - joint velocities
-//   key_body_local_pos       (18)  - 6 key bodies * 3 (relative to root, in heading frame)
-//
-// IMPORTANT: The ONNX model already contains the observation normalizer,
-// so this function returns RAW (un-normalized) observations.
+// Forward kinematics: compute body positions and rotations from root + joint quats.
+// Returns { pos: Array(numBodies), rot: Array(numBodies) }
 // ---------------------------------------------------------------------------
-// Build observation from a raw state object (no PhysX reads).
-// state = { root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos }
+function computeFK(rootPos, rootRot, jointRotQuats) {
+    const numBodies = humanoidData.fk_parent_indices.length;
+    const pos = new Array(numBodies);
+    const rot = new Array(numBodies);
+    pos[0] = rootPos;
+    rot[0] = rootRot;
+    for (let j = 1; j < numBodies; j++) {
+        const jRot = jointRotQuats[j - 1];
+        const localTrans = humanoidData.fk_local_translations[j];
+        const localRot = humanoidData.fk_local_rotations[j];
+        const parentIdx = humanoidData.fk_parent_indices[j];
+        const pPos = pos[parentIdx], pRot = rot[parentIdx];
+        const wt = quatRotateVec(pRot, localTrans);
+        pos[j] = [pPos[0]+wt[0], pPos[1]+wt[1], pPos[2]+wt[2]];
+        rot[j] = quatMul(pRot, quatMul(localRot, jRot));
+    }
+    return { pos, rot };
+}
+
 // ---------------------------------------------------------------------------
-function buildObservationFromState(state) {
+// Convert DOF positions array to per-joint quaternions using kinematicJoints.
+// Returns array of quaternions [x,y,z,w], one per non-root body.
+// ---------------------------------------------------------------------------
+function dofToJointQuats(dofPositions) {
+    const quats = [];
+    for (const kj of humanoidData.kinematicJoints) {
+        let q;
+        if (kj.type === 'SPHERICAL') {
+            q = expMapToQuat(dofPositions[kj.dof_idx], dofPositions[kj.dof_idx+1], dofPositions[kj.dof_idx+2]);
+        } else if (kj.type === 'HINGE') {
+            q = axisAngleToQuat(kj.axis, dofPositions[kj.dof_idx]);
+        } else {
+            q = [0, 0, 0, 1];
+        }
+        quats.push(q);
+    }
+    return quats;
+}
+
+// ---------------------------------------------------------------------------
+// Generalized observation builder — matches Python's observation pipeline
+// for all env types: ase, amp, deepmimic, add, task_location, task_steering.
+//
+// Observation = char_obs [+ tar_obs] [+ task_obs]
+//
+// char_obs: root_height, root_rot, root_vel, root_ang_vel, joint_rots, dof_vel, key_body_pos
+// tar_obs:  per-step (root_pos, root_rot, joint_rots, key_pos) relative to reference
+// task_obs: location(2) or steering(5) — filled with defaults
+// ---------------------------------------------------------------------------
+
+// Cached init-pose data for tar_obs (computed once per model load)
+let _initJointRotQuats = null;
+let _initFK = null;
+
+function ensureInitPoseCache() {
+    if (_initJointRotQuats) return;
+    const initDof = humanoidData.init_dof_pos;
+    if (!initDof || !humanoidData.kinematicJoints) return;
+    _initJointRotQuats = dofToJointQuats(initDof);
+    const initRootPos = humanoidData.init_root_pos || [0, 0, humanoidData.pelvis_z || 0.9];
+    const initRootRot = humanoidData.init_root_rot_quat || [0, 0, 0, 1];
+    _initFK = computeFK(initRootPos, initRootRot, _initJointRotQuats);
+}
+
+function buildObservation() {
     const obs = new Float32Array(humanoidData.obs_dim);
-    const rootPos = state.root_pos;
-    const rootRot = state.root_rot;
-    const rootVel = state.root_vel;
-    const rootAngVel = state.root_ang_vel;
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    const isGlobal = !!humanoidData.global_obs;
+    const hasRootHeight = humanoidData.root_height_obs !== false; // default true
 
-    const heading = calcHeading(rootRot);
-    const headingInv = axisAngleToQuat([0, 0, 1], -heading);
+    // Build body link map
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
 
+    // --- Get root state from PhysX ---
+    const rootPose = links[0].link.getGlobalPose();
+    const rpx = rootPose.get_p(), rqx = rootPose.get_q();
+    const rootPos = [rpx.get_x(), rpx.get_y(), rpx.get_z()];
+    const rootRot = [rqx.get_x(), rqx.get_y(), rqx.get_z(), rqx.get_w()];
+    const rv = links[0].link.getLinearVelocity();
+    const rootVel = [rv.get_x(), rv.get_y(), rv.get_z()];
+    const raw = links[0].link.getAngularVelocity();
+    const rootAngVel = [raw.get_x(), raw.get_y(), raw.get_z()];
+
+    const headingInv = calcHeadingQuatInv(rootRot);
     let idx = 0;
 
-    // [0] Root height
-    obs[idx++] = rootPos[2];
+    // ── char_obs (matches compute_char_obs) ─────────────────────────────────
 
-    // [1..6] Root rotation (heading-local tan_norm)
-    if (humanoidData.global_obs) {
+    // Root height
+    if (hasRootHeight) obs[idx++] = rootPos[2];
+
+    // Root rotation as tan_norm
+    if (isGlobal) {
         const tn = quatToTanNorm(rootRot);
         for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
     } else {
-        const localRootRot = quatMul(headingInv, rootRot);
-        const tn = quatToTanNorm(localRootRot);
+        const tn = quatToTanNorm(quatMul(headingInv, rootRot));
         for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
     }
 
-    // [7..9] Root velocity
-    if (humanoidData.global_obs) {
+    // Root velocity
+    if (isGlobal) {
         obs[idx++] = rootVel[0]; obs[idx++] = rootVel[1]; obs[idx++] = rootVel[2];
     } else {
         const lv = quatRotateVec(headingInv, rootVel);
         obs[idx++] = lv[0]; obs[idx++] = lv[1]; obs[idx++] = lv[2];
     }
 
-    // [10..12] Root angular velocity
-    if (humanoidData.global_obs) {
+    // Root angular velocity
+    if (isGlobal) {
         obs[idx++] = rootAngVel[0]; obs[idx++] = rootAngVel[1]; obs[idx++] = rootAngVel[2];
     } else {
         const la = quatRotateVec(headingInv, rootAngVel);
         obs[idx++] = la[0]; obs[idx++] = la[1]; obs[idx++] = la[2];
     }
 
-    // [13..108] Joint rotations as tan_norm
-    const dofPositions = state.dof_pos;
-    const jointRotQuats = [];
-    for (const kj of humanoidData.kinematicJoints) {
-        let quat;
-        if (kj.type === 'SPHERICAL') {
-            quat = expMapToQuat(dofPositions[kj.dof_idx], dofPositions[kj.dof_idx+1], dofPositions[kj.dof_idx+2]);
-        } else if (kj.type === 'HINGE') {
-            quat = axisAngleToQuat(kj.axis, dofPositions[kj.dof_idx]);
-        } else {
-            quat = [0, 0, 0, 1];
+    // Joint rotations as tan_norm — read DOF positions in DFS body order
+    // (matches Python kin_char_model DOF ordering, NOT actuator order)
+    const dofsDFS = humanoidData.dofInfoDFS || humanoidData.dofInfo;
+    const numDofs = dofsDFS.length;
+    const dofPositions = new Float32Array(numDofs);
+    for (let i = 0; i < numDofs; i++) {
+        const dof = dofsDFS[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (childLink) {
+            try {
+                dofPositions[i] = childLink.getInboundJoint().getJointPosition(axisEnums[dof.physx_axis]);
+            } catch(e) { /* 0 */ }
         }
-        jointRotQuats.push(quat);
-        const tn = quatToTanNorm(quat);
+    }
+
+    const jointRotQuats = dofToJointQuats(dofPositions);
+    for (const q of jointRotQuats) {
+        const tn = quatToTanNorm(q);
         for (let k = 0; k < 6; k++) obs[idx++] = tn[k];
     }
 
-    // DOF velocities
-    for (let i = 0; i < state.dof_vel.length; i++) {
-        obs[idx++] = state.dof_vel[i];
+    // DOF velocities (DFS body order)
+    for (const dof of dofsDFS) {
+        try {
+            const childLink = bodyLinkMap[dof.child_body];
+            if (childLink) {
+                obs[idx++] = childLink.getInboundJoint().getJointVelocity(axisEnums[dof.physx_axis]);
+            } else { obs[idx++] = 0; }
+        } catch(e) { obs[idx++] = 0; }
     }
 
-    // Key body positions via FK
-    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
-        const numBodies = humanoidData.fk_parent_indices.length;
-        const fkPos = new Array(numBodies);
-        const fkRot = new Array(numBodies);
-        fkPos[0] = rootPos;
-        fkRot[0] = rootRot;
-
-        for (let j = 1; j < numBodies; j++) {
-            const jRot = jointRotQuats[j - 1];
-            const localTrans = humanoidData.fk_local_translations[j];
-            const localRot = humanoidData.fk_local_rotations[j];
-            const parentIdx = humanoidData.fk_parent_indices[j];
-            const parentPos = fkPos[parentIdx];
-            const parentRot = fkRot[parentIdx];
-            const worldTrans = quatRotateVec(parentRot, localTrans);
-            fkPos[j] = [parentPos[0]+worldTrans[0], parentPos[1]+worldTrans[1], parentPos[2]+worldTrans[2]];
-            const localCombined = quatMul(localRot, jRot);
-            fkRot[j] = quatMul(parentRot, localCombined);
-        }
-
-        const keyIds = humanoidData.key_body_ids;
+    // Key body positions via forward kinematics
+    const keyIds = humanoidData.key_body_ids || [];
+    if (keyIds.length > 0 && humanoidData.fk_parent_indices) {
+        const fk = computeFK(rootPos, rootRot, jointRotQuats);
         for (const bid of keyIds) {
-            const bp = fkPos[bid];
+            const bp = fk.pos[bid];
             const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
-            if (humanoidData.global_obs) {
+            if (isGlobal) {
                 obs[idx++] = rel[0]; obs[idx++] = rel[1]; obs[idx++] = rel[2];
             } else {
                 const lr = quatRotateVec(headingInv, rel);
@@ -1411,152 +1585,97 @@ function buildObservationFromState(state) {
         }
     }
 
-    return obs;
-}
+    // ── tar_obs (matches compute_tar_obs × tar_obs_steps) ───────────────────
+    // For DeepMimic/ADD models: use init pose as the static target reference.
+    // The character sees "your target is the init pose" and tries to hold it.
+    if (humanoidData.enable_tar_obs && humanoidData.tar_obs_steps) {
+        ensureInitPoseCache();
+        const steps = humanoidData.tar_obs_steps;
+        const initRootPos = humanoidData.init_root_pos || [0, 0, humanoidData.pelvis_z || 0.9];
+        const initRootRot = humanoidData.init_root_rot_quat || [0, 0, 0, 1];
 
-// ---------------------------------------------------------------------------
-function buildObservation() {
-    const obs = new Float32Array(humanoidData.obs_dim);
-    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+        // Reference frame: for global_obs, ref = current root; for local, ref = target[0]
+        let refRootPos, refRootRot;
+        if (isGlobal) {
+            refRootPos = rootPos;
+            refRootRot = rootRot;
+        } else {
+            refRootPos = initRootPos;
+            refRootRot = initRootRot;
+        }
+        const refHeadingInv = isGlobal ? null : calcHeadingQuatInv(refRootRot);
 
-    // Build body link map
-    const bodyLinkMap = {};
-    for (const l of links) bodyLinkMap[l.name] = l.link;
+        for (let s = 0; s < steps.length; s++) {
+            // Target root position relative to reference
+            let rpObs = [
+                initRootPos[0] - refRootPos[0],
+                initRootPos[1] - refRootPos[1],
+                initRootPos[2] - refRootPos[2]
+            ];
 
-    // --- Get root state from PhysX (already Z-up) ---
-    const rootPose = links[0].link.getGlobalPose();
-    const rpx = rootPose.get_p();
-    const rqx = rootPose.get_q();
+            // Target rotation
+            let tarRot = initRootRot.slice();
 
-    // Root position - already Z-up
-    const rootPos = [rpx.get_x(), rpx.get_y(), rpx.get_z()];
-    // Root quaternion - already Z-up [x,y,z,w]
-    const rootRot = [rqx.get_x(), rqx.get_y(), rqx.get_z(), rqx.get_w()];
+            if (!isGlobal) {
+                rpObs = quatRotateVec(refHeadingInv, rpObs);
+                tarRot = quatMul(refHeadingInv, tarRot);
+            }
 
-    // Root velocity - already Z-up
-    const rv = links[0].link.getLinearVelocity();
-    const rootVel = [rv.get_x(), rv.get_y(), rv.get_z()];
-    // Root angular velocity - already Z-up
-    const raw = links[0].link.getAngularVelocity();
-    const rootAngVel = [raw.get_x(), raw.get_y(), raw.get_z()];
+            // root_pos_obs: 3 dims (Z replaced with absolute height when root_height_obs)
+            if (hasRootHeight) {
+                rpObs[2] = initRootPos[2]; // absolute Z
+            }
+            obs[idx++] = rpObs[0]; obs[idx++] = rpObs[1]; obs[idx++] = rpObs[2];
 
-    // Compute heading inverse quaternion for local-frame transform
-    const headingInv = calcHeadingQuatInv(rootRot);
+            // root_rot_obs: 6 dims (tan_norm)
+            const tn = quatToTanNorm(tarRot);
+            for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
 
-    let idx = 0;
+            // joint_rot_obs: (num_bodies-1) * 6 dims (tan_norm per joint)
+            if (_initJointRotQuats) {
+                for (const q of _initJointRotQuats) {
+                    const jtn = quatToTanNorm(q);
+                    for (let k = 0; k < 6; k++) obs[idx++] = jtn[k];
+                }
+            }
 
-    // [0] Root height (Z coordinate in Z-up frame)
-    obs[idx++] = rootPos[2];
-
-    // [1..6] Root rotation in local heading frame as tan_norm (6)
-    const localRootRot = quatMul(headingInv, rootRot);
-    const rootTanNorm = quatToTanNorm(localRootRot);
-    for (let i = 0; i < 6; i++) obs[idx++] = rootTanNorm[i];
-
-    // [7..9] Root linear velocity in heading frame (3)
-    const localVel = quatRotateVec(headingInv, rootVel);
-    obs[idx++] = localVel[0];
-    obs[idx++] = localVel[1];
-    obs[idx++] = localVel[2];
-
-    // [10..12] Root angular velocity in heading frame (3)
-    const localAngVel = quatRotateVec(headingInv, rootAngVel);
-    obs[idx++] = localAngVel[0];
-    obs[idx++] = localAngVel[1];
-    obs[idx++] = localAngVel[2];
-
-    // [13..108] Joint rotations as tan_norm (16 joints x 6 = 96)
-    // Read all 31 DOF positions using dofInfo to match Python kinematic model order
-    const dofPositions = new Float32Array(31);
-    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
-        const dof = humanoidData.dofInfo[i];
-        const childLink = bodyLinkMap[dof.child_body];
-        if (childLink) {
-            try {
-                const joint = childLink.getInboundJoint();
-                dofPositions[i] = joint.getJointPosition(axisEnums[dof.physx_axis]);
-            } catch(e) { dofPositions[i] = 0; }
+            // key_pos: num_key_bodies * 3 dims (relative to target root)
+            if (keyIds.length > 0 && _initFK) {
+                for (const bid of keyIds) {
+                    const bp = _initFK.pos[bid];
+                    let rel = [bp[0] - initRootPos[0], bp[1] - initRootPos[1], bp[2] - initRootPos[2]];
+                    if (!isGlobal && refHeadingInv) {
+                        rel = quatRotateVec(refHeadingInv, rel);
+                    }
+                    obs[idx++] = rel[0]; obs[idx++] = rel[1]; obs[idx++] = rel[2];
+                }
+            }
         }
     }
 
-    // Iterate kinematic joints and convert to tan_norm
-    // Also store quaternions for FK computation later
-    const jointRotQuats = [];
-    for (const kj of humanoidData.kinematicJoints) {
-        let quat;
-        if (kj.type === 'SPHERICAL') {
-            const ex = dofPositions[kj.dof_idx];
-            const ey = dofPositions[kj.dof_idx + 1];
-            const ez = dofPositions[kj.dof_idx + 2];
-            quat = expMapToQuat(ex, ey, ez);
-        } else if (kj.type === 'HINGE') {
-            const angle = dofPositions[kj.dof_idx];
-            quat = axisAngleToQuat(kj.axis, angle);  // axis is in Z-up coordinates
-        } else {  // FIXED
-            quat = [0, 0, 0, 1];  // identity
-        }
-        jointRotQuats.push(quat);
-        const tn = quatToTanNorm(quat);
-        for (let k = 0; k < 6; k++) obs[idx++] = tn[k];
+    // ── task_obs (location / steering) ──────────────────────────────────────
+    const envName = humanoidData.env_name || '';
+    if (envName === 'task_location') {
+        // 2 dims: local target position XY (heading-relative)
+        // Default: target is directly ahead at 2m
+        const tarPos = [rootPos[0] + 2, rootPos[1], rootPos[2]];
+        const relTar = [tarPos[0] - rootPos[0], tarPos[1] - rootPos[1], tarPos[2] - rootPos[2]];
+        const localTar = quatRotateVec(headingInv, relTar);
+        obs[idx++] = localTar[0]; obs[idx++] = localTar[1];
+    } else if (envName === 'task_steering') {
+        // 5 dims: local_tar_dir(2) + tar_speed(1) + local_face_dir(2)
+        // Default: move forward at 1 m/s, face forward
+        const tarDir3d = quatRotateVec(headingInv, [1, 0, 0]);
+        obs[idx++] = tarDir3d[0]; obs[idx++] = tarDir3d[1]; // local_tar_dir
+        obs[idx++] = 1.0; // tar_speed
+        const faceDir3d = quatRotateVec(headingInv, [1, 0, 0]);
+        obs[idx++] = faceDir3d[0]; obs[idx++] = faceDir3d[1]; // local_face_dir
     }
 
-    // [109..139] DOF velocities (31)
-    for (const dof of humanoidData.dofInfo) {
-        try {
-            const childLink = bodyLinkMap[dof.child_body];
-            if (childLink) {
-                const joint = childLink.getInboundJoint();
-                obs[idx++] = joint.getJointVelocity(axisEnums[dof.physx_axis]);
-            } else { obs[idx++] = 0; }
-        } catch(e) { obs[idx++] = 0; }
+    if (idx !== humanoidData.obs_dim) {
+        console.warn('Obs dim mismatch: filled', idx, 'expected', humanoidData.obs_dim);
     }
 
-    // [140..157] Key body positions via JS-side forward kinematics
-    // (Python uses kin_char_model.forward_kinematics via get_body_pos)
-    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
-        const numBodies = humanoidData.fk_parent_indices.length;
-        const fkPos = new Array(numBodies);
-        const fkRot = new Array(numBodies);
-
-        // Body 0 = root
-        fkPos[0] = rootPos;
-        fkRot[0] = rootRot;
-
-        // jointRotQuats was built during joint rotation section above
-        for (let j = 1; j < numBodies; j++) {
-            const jRot = jointRotQuats[j - 1];
-            const localTrans = humanoidData.fk_local_translations[j];
-            const localRot = humanoidData.fk_local_rotations[j];
-            const parentIdx = humanoidData.fk_parent_indices[j];
-
-            const parentPos = fkPos[parentIdx];
-            const parentRot = fkRot[parentIdx];
-
-            const worldTrans = quatRotateVec(parentRot, localTrans);
-            fkPos[j] = [parentPos[0] + worldTrans[0], parentPos[1] + worldTrans[1], parentPos[2] + worldTrans[2]];
-
-            const localCombined = quatMul(localRot, jRot);
-            fkRot[j] = quatMul(parentRot, localCombined);
-        }
-
-        // Key body positions from JS-side FK (matches Python kin_char_model)
-        // Note: Isaac Lab's get_body_pos returns PhysX link positions which differ
-        // from FK, but the policy was trained with the kin_char_model FK positions
-        // passed through compute_char_obs.
-        const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
-        for (const bid of keyIds) {
-            const bp = fkPos[bid];
-            const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
-            const localRel = quatRotateVec(headingInv, rel);
-            obs[idx++] = localRel[0];
-            obs[idx++] = localRel[1];
-            obs[idx++] = localRel[2];
-        }
-    } else {
-        idx += 18;
-    }
-
-    // No normalization here - the ONNX model handles it internally
     return obs;
 }
 
@@ -1579,35 +1698,29 @@ async function runPolicy(obs) {
 // Apply actions as PD drive targets
 // ---------------------------------------------------------------------------
 function applyActions(action) {
+    // Policy output (action) is in DFS body order (same as kin_char_model DOF order).
+    // Apply using dofInfoDFS to match this ordering.
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
     const bodyLinkMap = {};
     for (const l of links) bodyLinkMap[l.name] = l.link;
 
-    // Clip actions to training bounds (matching env's _build_action_bounds_pos)
+    // Action bounds are also in DFS order (from _build_action_bounds_pos)
     const aLow = humanoidData.action_low;
     const aHigh = humanoidData.action_high;
+    const dofsDFS = humanoidData.dofInfoDFS || humanoidData.dofInfo;
 
-    let appliedCount = 0;
-    let clippedMin = Infinity, clippedMax = -Infinity;
-    let rawMin = Infinity, rawMax = -Infinity;
-    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
-        const dof = humanoidData.dofInfo[i];
+    for (let i = 0; i < dofsDFS.length; i++) {
+        const dof = dofsDFS[i];
         const childLink = bodyLinkMap[dof.child_body];
-        if (!childLink) { continue; }
+        if (!childLink) continue;
         try {
             const joint = childLink.getInboundJoint();
             if (!joint) continue;
-            // Clip to action bounds
             let a = action[i];
-            rawMin = Math.min(rawMin, a);
-            rawMax = Math.max(rawMax, a);
             if (aLow && aHigh) {
                 a = Math.max(aLow[i], Math.min(aHigh[i], a));
             }
-            clippedMin = Math.min(clippedMin, a);
-            clippedMax = Math.max(clippedMax, a);
             joint.setDriveTarget(axisEnums[dof.physx_axis], a);
-            appliedCount++;
         } catch(e) {
             if (!window._applyWarnLogged) {
                 console.warn('setDriveTarget failed for', dof.axis_name, ':', e.message);
@@ -1836,6 +1949,7 @@ async function mainLoop(timestamp) {
                     if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
                 }
             } else {
+                // When policy disabled, hold init pose (DFS order, matching applyActions)
                 applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
             }
         }
@@ -1926,6 +2040,8 @@ function teardownModel() {
     window._simAccum = 0;
     window._lastSimTimestamp = 0;
     resetGraceFrames = RESET_GRACE;
+    _initJointRotQuats = null;
+    _initFK = null;
 
     // Remove articulation from PhysX
     if (articulation && pxScene) {
@@ -2129,6 +2245,9 @@ function buildGUI() {
     statsFolder.add(stats, 'fps').name('FPS').disable().listen();
     statsFolder.close();
     window._guiStats = stats;
+
+    // Expose module internals for Playwright testing
+    window._mimickit = { humanoidData, links, PhysX, articulation };
 }
 
 // ---------------------------------------------------------------------------
