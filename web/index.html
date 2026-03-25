@@ -986,6 +986,13 @@ function quatToTanNorm(q) {
     return [tan[0], tan[1], tan[2], norm[0], norm[1], norm[2]];
 }
 
+// Expose math functions for external scripts (aseObs.js, aseTaskObs.js)
+window.quatRotateVec = quatRotateVec;
+window.quatMul = quatMul;
+window.calcHeading = calcHeading;
+window.calcHeadingQuatInv = calcHeadingQuatInv;
+window.quatToTanNorm = quatToTanNorm;
+
 // ---------------------------------------------------------------------------
 // Build observation vector - matches Python compute_char_obs exactly.
 //
