@@ -47,10 +47,6 @@ canvas { display: block; }
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
 <!-- MJCF parser (converts MuJoCo XML to humanoidData at runtime) -->
 <script src="parseMJCF.js"></script>
-<!-- ASE obs computation (253-dim body-centric format for original ASE LLC) -->
-<script src="aseObs.js"></script>
-<!-- ASE task obs (heading, location, reach, strike) -->
-<script src="aseTaskObs.js"></script>
 
 <!-- Import map for three.js -->
 <script type="importmap">
@@ -106,29 +102,6 @@ let origDrives = [];
 let currentAction = null;
 let resetGraceFrames = 60;
 
-// ASE LLC + HLC pipeline (for task-directed control)
-let aseLLCSession = null;   // ONNX session for ASE LLC (253-dim obs)
-let hlcSessions = {};        // { heading: session, location: session, ... }
-let activeMode = 'free';     // 'free' | 'heading' | 'location' | 'reach' | 'strike'
-let taskTarget = [3, 0];     // XY world-space target for heading/location
-
-// PD action rescaling: ASE LLC outputs [-1,1], needs offset + scale * action
-const pdActionOffset = [0.0,0.2618,0.0,0.0,0.17455,0.0,0.2618,0.0,0.87265,1.39625,0.0,0.0,0.0,-0.2618,0.0,-0.87265,-1.39625,-0.2618,0.0,-0.69815,1.39625,0.0,0.0,0.0,0.2618,0.0,-0.69815,1.39625,0.0,0.0,0.0];
-const pdActionScale = [1.0472,1.309,1.2217,0.8727,0.87265,0.7854,2.1817,1.5708,1.91985,1.39625,1.5708,1.5708,1.5708,2.1817,1.5708,1.91985,1.39625,0.7854,1.0472,1.74535,1.39625,0.5236,0.9599,0.6981,0.7854,1.0472,1.74535,1.39625,0.5236,0.9599,0.6981];
-
-// ASE PD gains: kp=5, kd=0.1, maxForce from gear values in ASE MJCF
-const aseKp = 5.0, aseKd = 0.1;
-const aseMaxForce = [200,200,200,50,50,50,100,100,100,70,50,50,50,100,100,100,70,100,150,50,150,50,50,50,100,150,50,150,50,50,50];
-
-function setDrivesForASE() {
-    for (const d of origDrives) {
-        const drive = new PhysX.PxArticulationDrive(aseKp, aseKd, aseMaxForce[0] || 200, E_FORCE);
-        d.joint.setDriveParams(d.axisEnum, drive);
-    }
-}
-function setDrivesForMimicKit() {
-    applyDriveParams(); // restores original drives
-}
 const RESET_GRACE = 90;
 
 function quatFromTwoVec(from, to) {
@@ -222,25 +195,6 @@ async function loadOnnxModel() {
         }
     }
 
-    // Load ASE LLC + HLC models for task-directed control
-    try {
-        const llcResp = await fetch('./ase_llc.onnx');
-        if (llcResp.ok) {
-            aseLLCSession = await ort.InferenceSession.create(await llcResp.arrayBuffer(), { executionProviders: ['wasm'] });
-            console.log('ASE LLC loaded (253-dim obs)');
-
-            // Load HLC models
-            for (const task of ['heading', 'location', 'reach', 'strike']) {
-                try {
-                    const hlcResp = await fetch(`./hlc_${task}.onnx`);
-                    if (hlcResp.ok) {
-                        hlcSessions[task] = await ort.InferenceSession.create(await hlcResp.arrayBuffer(), { executionProviders: ['wasm'] });
-                        console.log(`  HLC ${task} loaded`);
-                    }
-                } catch(e) {}
-            }
-        }
-    } catch(e) { console.log('ASE LLC not available, using MimicKit LLC only'); }
 }
 
 /**
@@ -1004,7 +958,7 @@ function quatToTanNorm(q) {
     return [tan[0], tan[1], tan[2], norm[0], norm[1], norm[2]];
 }
 
-// Expose math functions for external scripts (aseObs.js, aseTaskObs.js)
+// Expose math functions globally
 window.quatRotateVec = quatRotateVec;
 window.quatMul = quatMul;
 window.calcHeading = calcHeading;
@@ -1551,77 +1505,9 @@ async function mainLoop(timestamp) {
             // Run policy
             if (policyEnabled) {
                 try {
-                    if (activeMode !== 'free' && aseLLCSession && hlcSessions[activeMode]) {
-                        // ASE HLC → LLC pipeline
-                        const aseObs = buildASEObs(links);
-                        if (!window._aseObsLogged) {
-                            window._aseObsLogged = true;
-                            console.log('ASE obs[0:10]:', Array.from(aseObs.slice(0,10)).map(v=>v.toFixed(3)));
-                            console.log('ASE obs range:', Math.min(...aseObs).toFixed(3), 'to', Math.max(...aseObs).toFixed(3));
-                            console.log('ASE obs non-zero:', Array.from(aseObs).filter(v=>Math.abs(v)>0.001).length, '/ 253');
-                        }
-                        // Compute task obs
-                        const rootPos = [links[0].link.getGlobalPose().get_p().get_x(),
-                                         links[0].link.getGlobalPose().get_p().get_y(),
-                                         links[0].link.getGlobalPose().get_p().get_z()];
-                        const rq = links[0].link.getGlobalPose().get_q();
-                        const rootRot = [rq.get_x(), rq.get_y(), rq.get_z(), rq.get_w()];
-
-                        let taskObs;
-                        if (activeMode === 'heading') {
-                            const dx = taskTarget[0] - rootPos[0], dy = taskTarget[1] - rootPos[1];
-                            const len = Math.sqrt(dx*dx + dy*dy) || 1;
-                            taskObs = computeHeadingTaskObs(rootRot, [dx/len, dy/len], 1.5, [dx/len, dy/len]);
-                        } else if (activeMode === 'location') {
-                            taskObs = computeLocationTaskObs(rootPos, rootRot, taskTarget);
-                        } else if (activeMode === 'reach') {
-                            taskObs = computeReachTaskObs(rootPos, rootRot, [...taskTarget, 1.0]);
-                        } else if (activeMode === 'strike') {
-                            taskObs = computeStrikeTaskObs(rootPos, rootRot,
-                                [...taskTarget, 0.8], [0,0,0,1], [0,0,0], [0,0,0]);
-                        }
-
-                        // Concat ASE obs + task obs for HLC
-                        const hlcInput = new Float32Array(aseObs.length + taskObs.length);
-                        hlcInput.set(aseObs);
-                        hlcInput.set(taskObs, aseObs.length);
-
-                        // Run HLC → latent
-                        const hlcResult = await hlcSessions[activeMode].run({
-                            obs: new ort.Tensor('float32', hlcInput, [1, hlcInput.length])
-                        });
-                        const hlcLatent = hlcResult.latent.data;
-
-                        // Normalize latent to unit sphere
-                        let norm = 0;
-                        for (let i = 0; i < hlcLatent.length; i++) norm += hlcLatent[i] * hlcLatent[i];
-                        norm = Math.sqrt(norm);
-                        if (norm > 0) for (let i = 0; i < hlcLatent.length; i++) hlcLatent[i] /= norm;
-
-                        // Run ASE LLC → action
-                        const llcResult = await aseLLCSession.run({
-                            obs: new ort.Tensor('float32', aseObs, [1, aseObs.length]),
-                            latent: new ort.Tensor('float32', hlcLatent, [1, hlcLatent.length])
-                        });
-                        const rawAction = llcResult.action.data;
-                        // Rescale from [-1,1] to PD targets: offset + scale * action
-                        currentAction = new Float32Array(rawAction.length);
-                        for (let i = 0; i < rawAction.length; i++) {
-                            currentAction[i] = pdActionOffset[i] + pdActionScale[i] * rawAction[i];
-                        }
-                        if (!window._aseLLCLogged) {
-                            window._aseLLCLogged = true;
-                            console.log('HLC latent[0:5]:', Array.from(hlcLatent).slice(0,5).map(v=>v.toFixed(3)));
-                            console.log('ASE LLC raw action[0:5]:', Array.from(rawAction).slice(0,5).map(v=>v.toFixed(3)));
-                            console.log('ASE LLC scaled action[0:5]:', Array.from(currentAction).slice(0,5).map(v=>v.toFixed(3)));
-                        }
-                        if (currentAction) applyActions(currentAction);
-                    } else {
-                        // MimicKit LLC (free mode with latent presets)
-                        const obs = buildObservation();
-                        currentAction = await runPolicy(obs);
-                        if (currentAction) applyActions(currentAction);
-                    }
+                    const obs = buildObservation();
+                    currentAction = await runPolicy(obs);
+                    if (currentAction) applyActions(currentAction);
                 } catch (e) {
                     if (!window._policyErrCount) window._policyErrCount = 0;
                     if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
@@ -1685,30 +1571,6 @@ async function init() {
 
         // Skills folder — load presets from latent_presets.json (encoded from motion clips)
         const skillFolder = gui.addFolder('Skills');
-        const modeOpts = ['Free'];
-        if (aseLLCSession) {
-            if (hlcSessions.heading) modeOpts.push('Heading');
-            if (hlcSessions.location) modeOpts.push('Location');
-            if (hlcSessions.reach) modeOpts.push('Reach');
-            if (hlcSessions.strike) modeOpts.push('Strike');
-        }
-        const modeParams = { mode: 'Free' };
-        skillFolder.add(modeParams, 'mode', modeOpts).name('Controller').onChange(v => {
-            activeMode = v.toLowerCase();
-            // Switch PD gains to match the active LLC
-            if (activeMode === 'free') {
-                setDrivesForMimicKit();
-            } else {
-                setDrivesForASE();
-            }
-            window._aseObsLogged = false; window._aseLLCLogged = false; // re-enable debug logging
-            console.log('Mode:', activeMode, activeMode === 'free' ? '(MimicKit drives)' : '(ASE drives: kp=5, kd=0.1)');
-        });
-
-        // Target position (for heading/location/reach/strike modes)
-        const targetParams = { x: 3, y: 0 };
-        skillFolder.add(targetParams, 'x', -10, 10, 0.1).name('Target X').onChange(v => { taskTarget[0] = v; });
-        skillFolder.add(targetParams, 'y', -10, 10, 0.1).name('Target Y').onChange(v => { taskTarget[1] = v; });
 
         const skillParams = { preset: 'Random', autoLatent, blendRate: latentBlendRate };
 
