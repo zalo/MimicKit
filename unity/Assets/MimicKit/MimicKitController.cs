@@ -7,6 +7,28 @@ using Unity.InferenceEngine;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
+public enum SkillPreset
+{
+    Random = -1,
+    WalkForward = 0,
+    StandStill = 1,
+    FrenzyAttack = 2,
+    OverheadStrike = 3,
+    ReliableKick = 4,
+    JumpBack = 5,
+    SpeedyBackAway = 6,
+    LivelyDodging = 7,
+    ReliableScaredAttack = 8,
+    ReliableBackswipe = 9,
+    ReliableBuckShieldbash = 10,
+    ReliableUpwardsShieldbash = 11,
+    CounterClockwiseTurn180 = 12,
+    SemiConfidentAttack = 13,
+    OverheadStrikeAndTurnLeft = 14,
+    ContinuousClockwiseTurn = 15,
+    KneeKick = 16,
+}
+
 /// <summary>
 /// Loads a MimicKit ONNX model, parses its baked MJCF + config metadata,
 /// builds a Unity ArticulationBody hierarchy, and runs the neural network
@@ -28,9 +50,12 @@ public class MimicKitController : MonoBehaviour
     [Tooltip("Physics substeps per policy step (4 = 120Hz physics / 30Hz policy)")]
     public int substeps = 4;
 
-    [Header("Skill Preset")]
-    [Tooltip("Index into latent presets (0 = Walk Forward, -1 = random)")]
-    public int presetIndex = 0;
+    [Header("Skill")]
+    public SkillPreset skillPreset = SkillPreset.WalkForward;
+
+    [Header("Control")]
+    [Tooltip("Check to reset the humanoid to its initial pose")]
+    public bool reset;
 
     // --- Parsed metadata ---
     MimicKitConfig config;
@@ -42,16 +67,40 @@ public class MimicKitController : MonoBehaviour
     Dictionary<string, ArticulationBody> bodyMap = new Dictionary<string, ArticulationBody>();
 
     // --- Inference ---
+    Model model;
     Worker worker;
     Tensor<float> obsTensor;
     Tensor<float> latentTensor;
     float[] latentVec;
     float[] currentAction;
     int physStep;
+    SkillPreset lastSkillPreset;
 
-    // --- Latent presets (from latent_codes.txt, embedded) ---
+    // --- Latent presets ---
     static readonly Dictionary<string, float[]> Presets = new Dictionary<string, float[]>();
     static readonly List<string> PresetNames = new List<string>();
+
+    // --- Body colors (matching web demo) ---
+    static readonly Dictionary<string, Color> BodyColors = new Dictionary<string, Color>
+    {
+        ["pelvis"] = new Color(0.33f, 0.47f, 0.67f),
+        ["torso"] = new Color(0.33f, 0.47f, 0.67f),
+        ["head"] = new Color(0.80f, 0.53f, 0.40f),
+        ["right_upper_arm"] = new Color(0.47f, 0.67f, 0.33f),
+        ["right_lower_arm"] = new Color(0.47f, 0.67f, 0.33f),
+        ["right_hand"] = new Color(0.80f, 0.53f, 0.40f),
+        ["sword"] = new Color(0.80f, 0.80f, 0.80f),
+        ["left_upper_arm"] = new Color(0.67f, 0.47f, 0.33f),
+        ["left_lower_arm"] = new Color(0.67f, 0.47f, 0.33f),
+        ["shield"] = new Color(0.53f, 0.53f, 0.80f),
+        ["left_hand"] = new Color(0.80f, 0.53f, 0.40f),
+        ["right_thigh"] = new Color(0.33f, 0.47f, 0.67f),
+        ["right_shin"] = new Color(0.33f, 0.47f, 0.67f),
+        ["right_foot"] = new Color(0.33f, 0.33f, 0.47f),
+        ["left_thigh"] = new Color(0.33f, 0.47f, 0.67f),
+        ["left_shin"] = new Color(0.33f, 0.47f, 0.67f),
+        ["left_foot"] = new Color(0.33f, 0.33f, 0.47f),
+    };
 
     struct BodyEntry
     {
@@ -68,7 +117,25 @@ public class MimicKitController : MonoBehaviour
         ParseMetadata();
         BuildArticulation();
         InitInference();
-        SetLatentPreset(presetIndex);
+        ApplySkillPreset(skillPreset);
+        lastSkillPreset = skillPreset;
+    }
+
+    void Update()
+    {
+        // Reset checkbox
+        if (reset)
+        {
+            reset = false;
+            ResetHumanoid();
+        }
+
+        // React to preset change in inspector
+        if (skillPreset != lastSkillPreset)
+        {
+            lastSkillPreset = skillPreset;
+            ApplySkillPreset(skillPreset);
+        }
     }
 
     void FixedUpdate()
@@ -88,6 +155,12 @@ public class MimicKitController : MonoBehaviour
         worker?.Dispose();
     }
 
+    void ResetHumanoid()
+    {
+        ApplyInitPose();
+        ApplySkillPreset(skillPreset);
+    }
+
     // ===== Model Loading =====
 
     void LoadModel()
@@ -95,7 +168,7 @@ public class MimicKitController : MonoBehaviour
         if (modelAsset == null)
             throw new Exception("MimicKitController: Assign the ONNX ModelAsset in the inspector.");
 
-        var model = ModelLoader.Load(modelAsset);
+        model = ModelLoader.Load(modelAsset);
         worker = new Worker(model, BackendType.CPU);
     }
 
@@ -195,9 +268,13 @@ public class MimicKitController : MonoBehaviour
             ab.solverVelocityIterations = 4;
             ab.sleepThreshold = 5e-5f;
 
-            // Add colliders for each geom
+            // Add colliders and visual meshes for each geom
+            Color bodyColor = BodyColors.ContainsKey(body.name) ? BodyColors[body.name] : new Color(0.53f, 0.53f, 0.53f);
             foreach (var geom in body.geoms)
+            {
                 AddCollider(go, geom);
+                AddVisualMesh(go, geom, bodyColor);
+            }
 
             bodyMap[body.name] = ab;
             bodyEntries.Add(new BodyEntry { name = body.name, body = ab, transform = go.transform });
@@ -382,18 +459,17 @@ public class MimicKitController : MonoBehaviour
         currentAction = new float[config.act_dim];
     }
 
-    void SetLatentPreset(int index)
+    void ApplySkillPreset(SkillPreset preset)
     {
-        if (PresetNames.Count == 0)
+        if (preset == SkillPreset.Random || PresetNames.Count == 0)
         {
-            // Fallback: random latent
             RandomLatent();
             return;
         }
 
-        index = Mathf.Clamp(index, 0, PresetNames.Count - 1);
-        var preset = Presets[PresetNames[index]];
-        Array.Copy(preset, latentVec, config.latent_dim);
+        int index = Mathf.Clamp((int)preset, 0, PresetNames.Count - 1);
+        var latent = Presets[PresetNames[index]];
+        Array.Copy(latent, latentVec, config.latent_dim);
         Debug.Log($"MimicKit: Loaded preset '{PresetNames[index]}'");
     }
 
@@ -428,7 +504,8 @@ public class MimicKitController : MonoBehaviour
         var output = worker.PeekOutput("action") as Tensor<float>;
         if (output != null)
         {
-            var data = output.ReadbackAndClone().DownloadToArray();
+            using var clone = output.ReadbackAndClone();
+            var data = clone.DownloadToArray();
             Array.Copy(data, currentAction, Mathf.Min(data.Length, currentAction.Length));
         }
 
@@ -753,6 +830,82 @@ public class MimicKitController : MonoBehaviour
         }
     }
 
+    void AddVisualMesh(GameObject parent, MJCFGeom geom, Color color)
+    {
+        var mat = new Material(Shader.Find("Standard"));
+        mat.color = color;
+
+        GameObject vis = null;
+
+        if (geom.type == "sphere")
+        {
+            vis = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            Destroy(vis.GetComponent<Collider>());
+            vis.transform.localScale = Vector3.one * geom.radius * 2f;
+            vis.transform.SetParent(parent.transform, false);
+            vis.transform.localPosition = ZupToYup(geom.pos);
+        }
+        else if (geom.type == "capsule" && geom.fromto != null)
+        {
+            var ft = geom.fromto;
+            Vector3 p0 = ZupToYup(new float[] { ft[0], ft[1], ft[2] });
+            Vector3 p1 = ZupToYup(new float[] { ft[3], ft[4], ft[5] });
+            Vector3 dir = p1 - p0;
+            float len = dir.magnitude;
+
+            vis = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+            Destroy(vis.GetComponent<Collider>());
+            // Unity capsule: height=2, radius=0.5 by default
+            float totalH = len + 2f * geom.radius;
+            vis.transform.localScale = new Vector3(geom.radius * 2f, totalH * 0.5f, geom.radius * 2f);
+            vis.transform.SetParent(parent.transform, false);
+            vis.transform.localPosition = (p0 + p1) * 0.5f;
+            if (len > 0.001f)
+                vis.transform.localRotation = Quaternion.FromToRotation(Vector3.up, dir.normalized);
+        }
+        else if (geom.type == "box" && geom.halfExtents != null)
+        {
+            vis = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            Destroy(vis.GetComponent<Collider>());
+            var he = geom.halfExtents;
+            vis.transform.localScale = new Vector3(he[0] * 2f, he[2] * 2f, he[1] * 2f); // Z-up -> Y-up
+            vis.transform.SetParent(parent.transform, false);
+            vis.transform.localPosition = ZupToYup(geom.pos);
+        }
+        else if (geom.type == "cylinder")
+        {
+            vis = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            Destroy(vis.GetComponent<Collider>());
+            if (geom.fromto != null)
+            {
+                var ft = geom.fromto;
+                Vector3 p0 = ZupToYup(new float[] { ft[0], ft[1], ft[2] });
+                Vector3 p1 = ZupToYup(new float[] { ft[3], ft[4], ft[5] });
+                Vector3 dir = p1 - p0;
+                float len = Mathf.Max(dir.magnitude, 0.01f);
+                // Unity cylinder: height=2, radius=0.5 by default
+                vis.transform.localScale = new Vector3(geom.radius * 2f, len * 0.5f, geom.radius * 2f);
+                vis.transform.SetParent(parent.transform, false);
+                vis.transform.localPosition = (p0 + p1) * 0.5f;
+                if (len > 0.001f)
+                    vis.transform.localRotation = Quaternion.FromToRotation(Vector3.up, dir.normalized);
+            }
+            else
+            {
+                float hh = geom.halfHeight > 0 ? geom.halfHeight : 0.015f;
+                vis.transform.localScale = new Vector3(geom.radius * 2f, hh, geom.radius * 2f);
+                vis.transform.SetParent(parent.transform, false);
+                vis.transform.localPosition = ZupToYup(geom.pos);
+            }
+        }
+
+        if (vis != null)
+        {
+            vis.GetComponent<Renderer>().material = mat;
+            vis.name = geom.name + "_visual";
+        }
+    }
+
     static void SetLayerRecursive(GameObject go, int layer)
     {
         go.layer = layer;
@@ -835,21 +988,32 @@ public class MimicKitController : MonoBehaviour
         Presets.Clear();
         PresetNames.Clear();
 
-        // Hardcoded presets matching the web demo
-        var presetData = new Dictionary<string, float[]>
+        // All presets matching the web demo, ordered to match SkillPreset enum
+        var presetData = new (string name, float[] vec)[]
         {
-            ["Walk Forward"] = new float[] {-0.1452f,-0.3008f,0.2979f,-0.0948f,-0.0689f,-0.0289f,-0.1291f,-0.1262f,0.0073f,0.1827f,0.0792f,-0.1077f,0.1575f,0.0871f,-0.0939f,-0.0555f,-0.0178f,-0.0836f,-0.0614f,0.1349f,0.0806f,0.1352f,0.2347f,0.0255f,-0.0159f,0.0209f,0.0127f,-0.0154f,0.0275f,-0.1192f,-0.0503f,0.0199f,-0.0181f,0.0478f,-0.1603f,-0.1162f,-0.0469f,0.1446f,-0.0181f,-0.1132f,-0.0137f,0.0032f,0.2209f,0.006f,0.0243f,-0.1142f,0.0293f,0.0628f,-0.2274f,0.3274f,0.1841f,-0.0464f,-0.1146f,0.0573f,0.218f,0.024f,-0.2133f,0.1156f,0.0734f,-0.2137f,0.0967f,0.0419f,-0.0053f,-0.0451f},
-            ["Stand Still"] = new float[] {0.0823f,0.0665f,0.0626f,0.0715f,-0.102f,-0.1834f,-0.2367f,-0.0636f,0.0142f,-0.0189f,0.2447f,0.1604f,-0.1471f,-0.1849f,0.0624f,-0.2257f,0.0198f,0.1578f,-0.0465f,0.1572f,-0.0124f,-0.2348f,0.0626f,0.0321f,0.1301f,-0.1334f,0.065f,-0.0826f,-0.1048f,-0.1132f,-0.098f,0.0812f,-0.1861f,-0.194f,0.0958f,-0.0116f,-0.1397f,-0.1597f,0.0273f,-0.0089f,-0.1377f,0.0304f,-0.0064f,0.0053f,0.1048f,0.0377f,-0.0781f,-0.149f,0.1906f,-0.263f,0.1719f,0.0553f,-0.12f,0.0875f,-0.039f,0.1607f,0.1923f,-0.1103f,0.023f,0.0306f,0.1093f,-0.2063f,-0.0024f,-0.0024f},
-            ["Frenzy Attack"] = new float[] {0.0595f,0.1815f,-0.0247f,-0.1175f,0.078f,-0.2466f,-0.1239f,0.0443f,-0.077f,0.0418f,-0.1932f,-0.1295f,0.0082f,0.1895f,-0.0754f,0.3816f,0.0177f,0.1045f,0.1036f,0.1625f,-0.1621f,0.0862f,-0.1163f,-0.0197f,0.0552f,0.0826f,-0.0476f,0.1087f,-0.0694f,-0.2286f,-0.1396f,-0.1861f,0.0406f,0.0124f,-0.0301f,-0.1529f,0.1192f,0.1319f,-0.0435f,0.2294f,-0.0147f,-0.1469f,0.0053f,-0.1236f,0.02f,-0.1372f,-0.0791f,-0.0429f,-0.1183f,-0.1449f,0.1248f,-0.1061f,-0.0326f,0.0421f,0.0182f,-0.1089f,-0.1872f,-0.0533f,0.0121f,-0.1538f,-0.1053f,-0.1679f,0.1177f,0.1281f},
-            ["Overhead Strike"] = new float[] {-0.0435f,0.0218f,-0.0879f,0.0008f,-0.0988f,-0.2055f,-0.2171f,0.0351f,0.1084f,-0.1148f,-0.1765f,-0.2086f,-0.0867f,-0.1654f,-0.2069f,0.1668f,-0.0254f,-0.0173f,0.1342f,0.1428f,0.1529f,0.0857f,0.0885f,0.1159f,0.0952f,-0.1534f,-0.2632f,-0.2138f,-0.0789f,-0.2705f,-0.0208f,-0.0089f,-0.1241f,-0.0723f,0.0792f,-0.0995f,0.0075f,0.2476f,-0.0161f,0.1016f,0.1169f,-0.0589f,-0.0114f,-0.1281f,-0.0169f,-0.0347f,0.1385f,-0.0887f,-0.0419f,-0.078f,-0.2256f,-0.0677f,-0.0981f,-0.0445f,-0.0427f,0.0467f,-0.2272f,0.0132f,-0.0887f,0.0037f,-0.1922f,-0.0025f,-0.0177f,0.1369f},
-            ["Reliable Kick"] = new float[] {0.1687f,-0.0675f,0.0733f,0.1104f,0.1888f,-0.2833f,0.2764f,-0.0861f,-0.0017f,-0.0958f,-0.0473f,0.0215f,0.1835f,0.0089f,-0.0972f,0.0592f,0.1358f,0.1714f,-0.0865f,-0.1585f,0.0647f,0.298f,0.084f,-0.1818f,0.1705f,0.1095f,0.0928f,0.0421f,-0.0365f,0.1083f,0.1311f,0.0091f,-0.0703f,-0.0693f,-0.0918f,-0.0285f,0.0624f,0.1283f,-0.134f,0.0859f,-0.0116f,0.0606f,0.2157f,0.268f,-0.0739f,-0.0086f,0.1455f,0.0935f,0.0415f,0.029f,-0.0822f,0.0896f,0.0423f,-0.054f,-0.1751f,-0.0879f,0.0447f,0.0172f,0.1776f,0.1071f,0.2338f,-0.1036f,0.0489f,0.0024f},
-            ["Jump Back"] = new float[] {-0.0278f,-0.1597f,0.0535f,-0.0853f,-0.063f,-0.0871f,-0.0606f,0.2214f,-0.1453f,0.0232f,0.2877f,0.1577f,0.2037f,0.1257f,0.0539f,-0.1776f,-0.0447f,0.0179f,-0.0674f,-0.0797f,0.0667f,-0.0078f,0.0265f,-0.177f,0.1485f,0.0266f,-0.1997f,-0.2082f,0.0736f,-0.1618f,-0.1899f,-0.2072f,0.0501f,0.1432f,0.0351f,0.1971f,-0.0809f,0.0912f,0.0234f,-0.0278f,-0.1118f,0.0764f,0.1357f,0.0962f,0.116f,0.2222f,-0.0974f,-0.0412f,0.1753f,0.1406f,-0.0213f,-0.0485f,0.055f,-0.0168f,0.166f,-0.2522f,0.0545f,-0.0637f,0.0657f,-0.0786f,0.1337f,-0.1115f,-0.0833f,0.1007f},
+            ("Walk Forward", new float[] {-0.1452f,-0.3008f,0.2979f,-0.0948f,-0.0689f,-0.0289f,-0.1291f,-0.1262f,0.0073f,0.1827f,0.0792f,-0.1077f,0.1575f,0.0871f,-0.0939f,-0.0555f,-0.0178f,-0.0836f,-0.0614f,0.1349f,0.0806f,0.1352f,0.2347f,0.0255f,-0.0159f,0.0209f,0.0127f,-0.0154f,0.0275f,-0.1192f,-0.0503f,0.0199f,-0.0181f,0.0478f,-0.1603f,-0.1162f,-0.0469f,0.1446f,-0.0181f,-0.1132f,-0.0137f,0.0032f,0.2209f,0.006f,0.0243f,-0.1142f,0.0293f,0.0628f,-0.2274f,0.3274f,0.1841f,-0.0464f,-0.1146f,0.0573f,0.218f,0.024f,-0.2133f,0.1156f,0.0734f,-0.2137f,0.0967f,0.0419f,-0.0053f,-0.0451f}),
+            ("Stand Still", new float[] {0.0823f,0.0665f,0.0626f,0.0715f,-0.102f,-0.1834f,-0.2367f,-0.0636f,0.0142f,-0.0189f,0.2447f,0.1604f,-0.1471f,-0.1849f,0.0624f,-0.2257f,0.0198f,0.1578f,-0.0465f,0.1572f,-0.0124f,-0.2348f,0.0626f,0.0321f,0.1301f,-0.1334f,0.065f,-0.0826f,-0.1048f,-0.1132f,-0.098f,0.0812f,-0.1861f,-0.194f,0.0958f,-0.0116f,-0.1397f,-0.1597f,0.0273f,-0.0089f,-0.1377f,0.0304f,-0.0064f,0.0053f,0.1048f,0.0377f,-0.0781f,-0.149f,0.1906f,-0.263f,0.1719f,0.0553f,-0.12f,0.0875f,-0.039f,0.1607f,0.1923f,-0.1103f,0.023f,0.0306f,0.1093f,-0.2063f,-0.0024f,-0.0024f}),
+            ("Frenzy Attack", new float[] {0.0595f,0.1815f,-0.0247f,-0.1175f,0.078f,-0.2466f,-0.1239f,0.0443f,-0.077f,0.0418f,-0.1932f,-0.1295f,0.0082f,0.1895f,-0.0754f,0.3816f,0.0177f,0.1045f,0.1036f,0.1625f,-0.1621f,0.0862f,-0.1163f,-0.0197f,0.0552f,0.0826f,-0.0476f,0.1087f,-0.0694f,-0.2286f,-0.1396f,-0.1861f,0.0406f,0.0124f,-0.0301f,-0.1529f,0.1192f,0.1319f,-0.0435f,0.2294f,-0.0147f,-0.1469f,0.0053f,-0.1236f,0.02f,-0.1372f,-0.0791f,-0.0429f,-0.1183f,-0.1449f,0.1248f,-0.1061f,-0.0326f,0.0421f,0.0182f,-0.1089f,-0.1872f,-0.0533f,0.0121f,-0.1538f,-0.1053f,-0.1679f,0.1177f,0.1281f}),
+            ("Overhead Strike", new float[] {-0.0435f,0.0218f,-0.0879f,0.0008f,-0.0988f,-0.2055f,-0.2171f,0.0351f,0.1084f,-0.1148f,-0.1765f,-0.2086f,-0.0867f,-0.1654f,-0.2069f,0.1668f,-0.0254f,-0.0173f,0.1342f,0.1428f,0.1529f,0.0857f,0.0885f,0.1159f,0.0952f,-0.1534f,-0.2632f,-0.2138f,-0.0789f,-0.2705f,-0.0208f,-0.0089f,-0.1241f,-0.0723f,0.0792f,-0.0995f,0.0075f,0.2476f,-0.0161f,0.1016f,0.1169f,-0.0589f,-0.0114f,-0.1281f,-0.0169f,-0.0347f,0.1385f,-0.0887f,-0.0419f,-0.078f,-0.2256f,-0.0677f,-0.0981f,-0.0445f,-0.0427f,0.0467f,-0.2272f,0.0132f,-0.0887f,0.0037f,-0.1922f,-0.0025f,-0.0177f,0.1369f}),
+            ("Reliable Kick", new float[] {0.1687f,-0.0675f,0.0733f,0.1104f,0.1888f,-0.2833f,0.2764f,-0.0861f,-0.0017f,-0.0958f,-0.0473f,0.0215f,0.1835f,0.0089f,-0.0972f,0.0592f,0.1358f,0.1714f,-0.0865f,-0.1585f,0.0647f,0.298f,0.084f,-0.1818f,0.1705f,0.1095f,0.0928f,0.0421f,-0.0365f,0.1083f,0.1311f,0.0091f,-0.0703f,-0.0693f,-0.0918f,-0.0285f,0.0624f,0.1283f,-0.134f,0.0859f,-0.0116f,0.0606f,0.2157f,0.268f,-0.0739f,-0.0086f,0.1455f,0.0935f,0.0415f,0.029f,-0.0822f,0.0896f,0.0423f,-0.054f,-0.1751f,-0.0879f,0.0447f,0.0172f,0.1776f,0.1071f,0.2338f,-0.1036f,0.0489f,0.0024f}),
+            ("Jump Back", new float[] {-0.0278f,-0.1597f,0.0535f,-0.0853f,-0.063f,-0.0871f,-0.0606f,0.2214f,-0.1453f,0.0232f,0.2877f,0.1577f,0.2037f,0.1257f,0.0539f,-0.1776f,-0.0447f,0.0179f,-0.0674f,-0.0797f,0.0667f,-0.0078f,0.0265f,-0.177f,0.1485f,0.0266f,-0.1997f,-0.2082f,0.0736f,-0.1618f,-0.1899f,-0.2072f,0.0501f,0.1432f,0.0351f,0.1971f,-0.0809f,0.0912f,0.0234f,-0.0278f,-0.1118f,0.0764f,0.1357f,0.0962f,0.116f,0.2222f,-0.0974f,-0.0412f,0.1753f,0.1406f,-0.0213f,-0.0485f,0.055f,-0.0168f,0.166f,-0.2522f,0.0545f,-0.0637f,0.0657f,-0.0786f,0.1337f,-0.1115f,-0.0833f,0.1007f}),
+            ("Speedy Back Away", new float[] {-0.2047f,-0.1917f,0.1478f,0.0607f,-0.0442f,0.1828f,0.0298f,-0.0526f,0.0088f,-0.0033f,-0.0484f,0.1613f,0.094f,0.0801f,-0.1263f,0.0468f,-0.0496f,-0.0291f,-0.1862f,-0.05f,0.1121f,0.1677f,-0.0317f,-0.0129f,0.0509f,-0.2283f,0.1011f,-0.0073f,0.0341f,0.2524f,-0.1716f,-0.2271f,-0.0385f,0.1303f,0.2235f,0.0802f,-0.046f,0.0309f,-0.0848f,0.0673f,-0.119f,0.0005f,-0.0896f,-0.2057f,0.0016f,0.2448f,-0.0253f,0.0401f,0.0528f,0.0418f,-0.0537f,0.1917f,0.1657f,0.0651f,0.0887f,-0.0892f,0.3693f,-0.0536f,0.0645f,0.0228f,-0.1082f,-0.0183f,-0.1149f,-0.1565f}),
+            ("Lively Dodging", new float[] {-0.0143f,0.2127f,0.0403f,-0.1327f,0.0317f,-0.1893f,0.043f,-0.0917f,-0.0761f,-0.013f,-0.2252f,-0.0225f,0.0836f,0.1184f,0.056f,-0.0104f,-0.024f,0.2205f,-0.0206f,-0.1338f,-0.1441f,0.0246f,-0.0188f,-0.2493f,-0.127f,-0.0168f,0.1393f,0.171f,0.0065f,-0.1721f,0.0553f,0.2961f,0.0109f,-0.1066f,0.1845f,-0.0435f,-0.0046f,-0.1811f,-0.0909f,-0.0683f,0.084f,-0.0585f,0.2442f,0.2234f,0.0048f,0.0881f,-0.1283f,0.0981f,0.0222f,0.1165f,-0.027f,-0.0947f,0.1541f,-0.0829f,-0.018f,0.0814f,0.0571f,-0.0988f,0.1372f,-0.2452f,-0.2308f,0.0804f,0.0431f,-0.0894f}),
+            ("Reliable Scared Attack", new float[] {-0.015f,0.2119f,0.1749f,-0.0633f,-0.1663f,0.1407f,0.006f,-0.035f,0.0561f,0.0822f,-0.1699f,0.0641f,0.0052f,0.0916f,-0.1486f,-0.0485f,-0.0704f,0.1227f,-0.0076f,0.1198f,0.0817f,0.1019f,-0.0184f,0.0917f,0.1762f,0.0105f,-0.0355f,-0.0148f,0.1344f,0.1321f,0.1878f,-0.0184f,-0.3125f,-0.0229f,-0.0231f,-0.0663f,0.0026f,-0.0953f,0.0304f,-0.1317f,-0.0917f,0.008f,-0.254f,0.0044f,0.2983f,0.2054f,0.0422f,-0.1952f,0.0041f,0.114f,-0.0158f,-0.0483f,0.0087f,0.0109f,0.0709f,0.091f,0.11f,-0.0737f,-0.1726f,-0.3136f,0.0204f,-0.2594f,-0.0918f,0.081f}),
+            ("Reliable Backswipe", new float[] {0.1982f,-0.0865f,0.0944f,-0.2489f,-0.1113f,-0.1048f,0.0218f,-0.1055f,0.2115f,-0.1007f,0.153f,0.0667f,0.0491f,0.1453f,-0.0954f,-0.1235f,-0.1588f,0.0414f,0.0324f,-0.1477f,-0.0211f,0.0588f,-0.0187f,-0.1474f,-0.1259f,-0.0059f,-0.0257f,-0.0686f,-0.2323f,-0.1037f,0.0378f,-0.0864f,-0.1359f,0.0811f,-0.3029f,0.1735f,-0.0253f,0.089f,-0.1424f,0.028f,-0.1449f,-0.2562f,0.2766f,-0.1525f,0.0334f,0.0007f,-0.0213f,-0.0006f,-0.067f,-0.0456f,0.0195f,-0.0462f,0.1584f,0.1504f,-0.024f,-0.0282f,-0.2546f,-0.0026f,0.0396f,0.0645f,0.0006f,0.0178f,0.1585f,0.1657f}),
+            ("Reliable Buck Shieldbash", new float[] {0.0147f,-0.1071f,-0.0575f,-0.0925f,0.0194f,-0.2383f,0.0202f,-0.0408f,-0.1094f,0.1627f,-0.0201f,-0.0478f,-0.0014f,0.1708f,0.0136f,-0.1677f,-0.1777f,0.2129f,0.0415f,0.0839f,0.0239f,-0.0046f,0.3436f,-0.1045f,0.0356f,0.0851f,-0.0842f,0.1067f,0.2573f,0.1408f,-0.105f,-0.0626f,-0.0018f,-0.0191f,0.2365f,-0.1052f,0.0477f,0.0649f,0.0286f,0.183f,-0.0381f,-0.0238f,0.1371f,0.2019f,0.0614f,0.1226f,0.1686f,0.0353f,0.1189f,0.1487f,0.1027f,-0.0746f,0.175f,-0.2154f,-0.0175f,0.0893f,0.0313f,-0.0709f,0.2553f,-0.0238f,-0.2038f,0.0321f,0.0597f,-0.0405f}),
+            ("Reliable Upwards Shieldbash", new float[] {-0.0185f,0.1354f,0.034f,0.1041f,0.2839f,-0.2167f,-0.0009f,0.1377f,-0.0501f,-0.2514f,0.0273f,0.1855f,-0.074f,-0.1259f,-0.02f,-0.1437f,0.1367f,0.0021f,0.0147f,-0.0162f,0.0852f,0.1908f,-0.0965f,0.0437f,-0.0199f,-0.0259f,-0.0702f,0.1735f,-0.0693f,-0.049f,-0.1967f,-0.0172f,-0.2007f,0.0395f,-0.0881f,0.3f,-0.115f,0.1332f,-0.1074f,0.0747f,0.0834f,-0.0279f,-0.1971f,-0.0074f,0.136f,0.0487f,-0.059f,-0.0356f,-0.0167f,-0.0344f,0.022f,0.0482f,-0.2204f,-0.089f,0.0129f,-0.1121f,0.3302f,-0.216f,-0.0105f,0.0028f,-0.1726f,-0.0011f,-0.0329f,-0.0558f}),
+            ("Counter Clockwise Turn 180", new float[] {-0.1594f,-0.0112f,0.1209f,0.0617f,-0.157f,-0.0268f,-0.0022f,0.0749f,-0.1356f,-0.1494f,-0.0153f,0.0262f,-0.0171f,-0.251f,-0.1037f,0.0571f,0.2721f,0.1869f,0.0249f,-0.0143f,0.0082f,0.0176f,0.1341f,-0.0991f,-0.0727f,-0.0101f,-0.097f,0.1979f,-0.1343f,0.1502f,0.061f,0.0504f,0.1022f,0.1266f,-0.1992f,-0.2592f,0.0042f,0.176f,0.025f,-0.181f,0.1063f,0.0755f,-0.1937f,-0.0417f,-0.291f,0.1636f,0.0326f,-0.1143f,0.1749f,-0.1011f,-0.1107f,0.1087f,-0.0842f,-0.0965f,0.074f,-0.06f,-0.133f,0.1433f,0.0698f,-0.0426f,-0.0136f,0.1723f,0.1277f,-0.0795f}),
+            ("Semi-Confident Attack", new float[] {0.0681f,-0.1512f,0.0828f,0.0363f,0.1679f,0.192f,-0.1132f,0.1329f,0.1523f,0.0772f,-0.0797f,0.0543f,0.1023f,-0.1551f,0.03f,-0.0118f,-0.0298f,0.1185f,0.1505f,-0.0285f,-0.1074f,-0.1345f,0.1648f,-0.0676f,0.0423f,0.1417f,-0.0001f,0.0669f,0.0213f,-0.1006f,0.1132f,-0.051f,-0.1751f,0.1089f,0.1207f,0.11f,-0.063f,-0.0133f,0.035f,0.0757f,0.216f,-0.191f,-0.0713f,-0.1795f,-0.0725f,0.1694f,-0.1799f,-0.2689f,-0.1773f,-0.0588f,-0.0261f,0.0526f,0.0982f,-0.092f,0.1461f,-0.0359f,-0.07f,-0.2553f,0.2099f,-0.231f,0.0232f,-0.0462f,0.2094f,0.1014f}),
+            ("Overhead Strike and Turn Left", new float[] {-0.0885f,-0.0039f,0.05f,0.2221f,-0.2381f,-0.1246f,-0.1138f,-0.0196f,0.2163f,-0.0791f,0.0752f,0.0357f,-0.1684f,0.0661f,-0.1955f,0.0609f,0.0809f,-0.0744f,0.2579f,0.1663f,0.0397f,0.0714f,0.1255f,0.0805f,0.0677f,0.1954f,-0.1565f,0.0065f,-0.003f,0.1274f,-0.1651f,-0.1222f,0.3107f,-0.1611f,0.0703f,-0.057f,-0.0676f,0.1307f,-0.13f,-0.1079f,-0.0352f,0.0986f,-0.0937f,0.0894f,-0.0034f,-0.167f,-0.2501f,-0.1425f,0.1371f,-0.0438f,-0.2296f,0.1059f,-0.0893f,-0.0076f,0.0013f,0.0035f,-0.0137f,-0.1095f,0.0011f,0.109f,0.0708f,0.017f,-0.1248f,-0.0481f}),
+            ("Continuous Clockwise Turn", new float[] {0.1144f,-0.0265f,-0.0697f,0.081f,0.0285f,-0.0667f,-0.0661f,0.0713f,0.1211f,0.2373f,0.0565f,0.0035f,-0.0343f,-0.0807f,-0.1167f,0.1945f,0.0615f,-0.1418f,0.0155f,0.0422f,-0.0781f,-0.0096f,0.1786f,-0.021f,0.0948f,0.0252f,-0.001f,0.0278f,0.0681f,0.0819f,-0.4215f,-0.0932f,0.0625f,-0.0009f,-0.1184f,0.3684f,0.0706f,0.1227f,0.1036f,-0.1458f,-0.1163f,-0.2255f,0.0558f,-0.1516f,-0.0305f,-0.0635f,0.176f,-0.0314f,0.0368f,0.0746f,0.0167f,-0.2061f,0.2213f,0.0221f,0.1448f,0.0951f,-0.0131f,-0.0087f,0.0023f,-0.1903f,0.1149f,-0.1594f,-0.0276f,-0.1271f}),
+            ("Knee Kick", new float[] {-0.1726f,0.2087f,0.0136f,-0.1687f,0.029f,0.0078f,0.0618f,-0.1522f,0.0816f,-0.0158f,-0.066f,0.0249f,0.008f,-0.109f,-0.115f,-0.1335f,0.1927f,0.2766f,-0.2196f,-0.1182f,0.049f,0.0185f,-0.0841f,-0.0124f,-0.0779f,-0.1243f,-0.0456f,0.0009f,0.3156f,0.1657f,0.1577f,-0.088f,-0.3035f,-0.1513f,-0.0079f,0.0822f,-0.0621f,-0.0472f,0.1181f,0.0682f,0.157f,-0.1083f,-0.1816f,-0.0351f,-0.1332f,-0.1885f,-0.0418f,-0.1103f,0.0936f,0.1706f,-0.0301f,0.0358f,0.1496f,0.0992f,-0.0414f,0.1192f,-0.0524f,0.0195f,-0.0299f,-0.0236f,0.1757f,-0.1478f,0.1142f,0.0575f}),
         };
 
-        foreach (var kv in presetData)
+        foreach (var (name, vec) in presetData)
         {
-            Presets[kv.Key] = kv.Value;
-            PresetNames.Add(kv.Key);
+            Presets[name] = vec;
+            PresetNames.Add(name);
         }
     }
 }
