@@ -268,12 +268,12 @@ public class MimicKitController : MonoBehaviour
             ab.solverVelocityIterations = 4;
             ab.sleepThreshold = 5e-5f;
 
-            // Add colliders and visual meshes for each geom
+            // Add visual meshes and colliders for each geom
             Color bodyColor = BodyColors.ContainsKey(body.name) ? BodyColors[body.name] : new Color(0.53f, 0.53f, 0.53f);
             foreach (var geom in body.geoms)
             {
-                AddCollider(go, geom);
-                AddVisualMesh(go, geom, bodyColor);
+                var visMesh = AddVisualMesh(go, geom, bodyColor);
+                AddCollider(go, geom, visMesh);
             }
 
             bodyMap[body.name] = ab;
@@ -772,7 +772,7 @@ public class MimicKitController : MonoBehaviour
         }
     }
 
-    void AddCollider(GameObject go, MJCFGeom geom)
+    void AddCollider(GameObject go, MJCFGeom geom, GameObject visualMesh)
     {
         if (geom.type == "sphere")
         {
@@ -791,7 +791,6 @@ public class MimicKitController : MonoBehaviour
             col.radius = geom.radius;
             col.height = len + 2 * geom.radius;
             col.center = (p0 + p1) * 0.5f;
-            // Determine capsule direction (0=X, 1=Y, 2=Z)
             float ax = Mathf.Abs(dir.x), ay = Mathf.Abs(dir.y), az = Mathf.Abs(dir.z);
             if (ay >= ax && ay >= az) col.direction = 1;
             else if (ax >= az) col.direction = 0;
@@ -805,32 +804,21 @@ public class MimicKitController : MonoBehaviour
         }
         else if (geom.type == "cylinder")
         {
-            // Approximate cylinder with capsule
-            var col = go.AddComponent<CapsuleCollider>();
-            col.radius = geom.radius;
-            if (geom.fromto != null)
+            // Use convex MeshCollider on the visual child (inherits its local transform)
+            if (visualMesh != null)
             {
-                var ft = geom.fromto;
-                Vector3 p0 = ZupToYup(new float[] { ft[0], ft[1], ft[2] });
-                Vector3 p1 = ZupToYup(new float[] { ft[3], ft[4], ft[5] });
-                Vector3 dv = p1 - p0;
-                col.height = dv.magnitude + 2 * geom.radius;
-                col.center = (p0 + p1) * 0.5f;
-                float aax = Mathf.Abs(dv.x), aay = Mathf.Abs(dv.y), aaz = Mathf.Abs(dv.z);
-                if (aay >= aax && aay >= aaz) col.direction = 1;
-                else if (aax >= aaz) col.direction = 0;
-                else col.direction = 2;
-            }
-            else
-            {
-                col.height = (geom.halfHeight * 2) + 2 * geom.radius;
-                col.center = ZupToYup(geom.pos);
-                col.direction = 1; // Y-up default
+                var mf = visualMesh.GetComponent<MeshFilter>();
+                if (mf != null && mf.sharedMesh != null)
+                {
+                    var col = visualMesh.AddComponent<MeshCollider>();
+                    col.sharedMesh = mf.sharedMesh;
+                    col.convex = true;
+                }
             }
         }
     }
 
-    void AddVisualMesh(GameObject parent, MJCFGeom geom, Color color)
+    GameObject AddVisualMesh(GameObject parent, MJCFGeom geom, Color color)
     {
         var mat = new Material(Shader.Find("Standard"));
         mat.color = color;
@@ -904,6 +892,8 @@ public class MimicKitController : MonoBehaviour
             vis.GetComponent<Renderer>().material = mat;
             vis.name = geom.name + "_visual";
         }
+
+        return vis;
     }
 
     static void SetLayerRecursive(GameObject go, int layer)
@@ -1430,43 +1420,27 @@ public static class MJCFParser
 
     static void ComputeJointFrame(List<float[]> jointAxes, out float[] q, out int[] axisMap)
     {
+        // Always map axes in natural MJCF order: axis0→twist(X), axis1→swingY, axis2→swingZ.
+        // No axis swapping — since we force axisMap=[0,1,2] for all spherical joints,
+        // the rotation matrix columns must match the MJCF axis order exactly.
         axisMap = new int[] { 0, 1, 2 };
         int n = jointAxes.Count;
 
         if (n == 0) { q = new float[] { 0, 0, 0, 1 }; return; }
         if (n == 1) { q = GetRotationQuat(new float[] { 1, 0, 0 }, jointAxes[0]); return; }
 
-        float[] Q = GetRotationQuat(jointAxes[0], new float[] { 1, 0, 0 });
-        float[] b = Normalize3(QuatRotate3(Q, jointAxes[1]));
+        float[] a0 = Normalize3(jointAxes[0]);
+        float[] a1 = Normalize3(jointAxes[1]);
 
         if (n == 2)
         {
-            if (Mathf.Abs(Dot3(b, new float[] { 0, 1, 0 })) > Mathf.Abs(Dot3(b, new float[] { 0, 0, 1 })))
-            {
-                axisMap[1] = 1;
-                float[] c = Normalize3(Cross3(jointAxes[0], jointAxes[1]));
-                q = Mat33ToQuat(Normalize3(jointAxes[0]), Normalize3(jointAxes[1]), c);
-            }
-            else
-            {
-                axisMap[1] = 2; axisMap[2] = 1;
-                float[] c = Normalize3(Cross3(jointAxes[1], jointAxes[0]));
-                q = Mat33ToQuat(Normalize3(jointAxes[0]), c, Normalize3(jointAxes[1]));
-            }
+            float[] a2 = Normalize3(Cross3(a0, a1));
+            q = Mat33ToQuat(a0, a1, a2);
             return;
         }
 
-        // n == 3
-        if (Mathf.Abs(Dot3(b, new float[] { 0, 1, 0 })) > Mathf.Abs(Dot3(b, new float[] { 0, 0, 1 })))
-        {
-            axisMap[1] = 1; axisMap[2] = 2;
-            q = Mat33ToQuat(Normalize3(jointAxes[0]), Normalize3(jointAxes[1]), Normalize3(jointAxes[2]));
-        }
-        else
-        {
-            axisMap[1] = 2; axisMap[2] = 1;
-            q = Mat33ToQuat(Normalize3(jointAxes[0]), Normalize3(jointAxes[2]), Normalize3(jointAxes[1]));
-        }
+        // n == 3: columns = [axis0, axis1, axis2]
+        q = Mat33ToQuat(a0, a1, Normalize3(jointAxes[2]));
     }
 
     static float[] GetRotationQuat(float[] from, float[] to)
