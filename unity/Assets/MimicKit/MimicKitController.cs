@@ -47,8 +47,8 @@ public class MimicKitController : MonoBehaviour
     public string onnxFileName = "ase_humanoid_sword_shield_actor.onnx";
 
     [Header("Simulation")]
-    [Tooltip("Physics substeps per policy step (4 = 120Hz physics / 30Hz policy)")]
-    public int substeps = 4;
+    [Tooltip("Policy inference rate in Hz (trained at 30Hz)")]
+    public float policyHz = 30f;
 
     [Header("Skill")]
     public SkillPreset skillPreset = SkillPreset.WalkForward;
@@ -76,7 +76,7 @@ public class MimicKitController : MonoBehaviour
     Tensor<float> latentTensor;
     float[] latentVec;
     float[] currentAction;
-    int physStep;
+    float policyAccum;
     SkillPreset lastSkillPreset;
 
     // --- Latent presets ---
@@ -143,10 +143,14 @@ public class MimicKitController : MonoBehaviour
 
     void FixedUpdate()
     {
-        physStep++;
-        if (physStep >= substeps)
+        // Run the policy at policyHz regardless of the physics timestep.
+        // With Fixed Timestep = 1/120s and policyHz = 30, this fires every 4th FixedUpdate.
+        // With Fixed Timestep = 1/50s (Unity default), it fires every ~1.67 FixedUpdates.
+        policyAccum += Time.fixedDeltaTime;
+        float policyDt = 1f / policyHz;
+        if (policyAccum >= policyDt)
         {
-            physStep = 0;
+            policyAccum -= policyDt;
             RunPolicyStep();
         }
     }
