@@ -105,6 +105,10 @@ public class MimicKitController : MonoBehaviour
         ["left_foot"] = new Color(0.33f, 0.33f, 0.47f),
     };
 
+    // --- Visual interpolation ---
+    Transform visualRoot;
+    List<Transform> visualBodies = new List<Transform>();
+
     struct BodyEntry
     {
         public string name;
@@ -138,6 +142,22 @@ public class MimicKitController : MonoBehaviour
         {
             lastSkillPreset = skillPreset;
             ApplySkillPreset(skillPreset);
+        }
+
+        // Interpolate visual body transforms toward physics poses.
+        // ArticulationBody doesn't support built-in interpolation, so we
+        // lerp the visuals between FixedUpdate poses at the render rate.
+        if (visualRoot != null)
+        {
+            float t = (Time.time - Time.fixedTime) / Time.fixedDeltaTime;
+            t = Mathf.Clamp01(t);
+            for (int i = 0; i < bodyEntries.Count && i < visualBodies.Count; i++)
+            {
+                var vis = visualBodies[i];
+                var phys = bodyEntries[i].body.transform;
+                vis.position = Vector3.Lerp(vis.position, phys.position, t);
+                vis.rotation = Quaternion.Slerp(vis.rotation, phys.rotation, t);
+            }
         }
     }
 
@@ -237,6 +257,12 @@ public class MimicKitController : MonoBehaviour
         // The MJCF data is Z-up. Unity is Y-up.
         // We build everything in Unity's Y-up frame via -90° rotation around X.
 
+        // Create a separate root for visual meshes (for interpolation)
+        var visGo = new GameObject("Visuals");
+        visGo.transform.SetParent(transform, false);
+        visualRoot = visGo.transform;
+        visualBodies.Clear();
+
         foreach (var body in mjcf.bodies)
         {
             GameObject go = new GameObject(body.name);
@@ -283,11 +309,15 @@ public class MimicKitController : MonoBehaviour
             ab.solverVelocityIterations = 4;
             ab.sleepThreshold = 5e-5f;
 
-            // Add visual meshes and colliders for each geom
+            // Add colliders to physics body, visual meshes to a separate interpolated container
             Color bodyColor = BodyColors.ContainsKey(body.name) ? BodyColors[body.name] : new Color(0.53f, 0.53f, 0.53f);
+            var visBody = new GameObject(body.name + "_vis");
+            visBody.transform.SetParent(visualRoot, false);
+            visualBodies.Add(visBody.transform);
+
             foreach (var geom in body.geoms)
             {
-                var visMesh = AddVisualMesh(go, geom, bodyColor);
+                var visMesh = AddVisualMesh(visBody, geom, bodyColor);
                 AddCollider(go, geom, visMesh);
             }
 
@@ -868,12 +898,19 @@ public class MimicKitController : MonoBehaviour
         }
         else if (geom.type == "cylinder")
         {
+            // Use a convex MeshCollider with the cylinder mesh from the visual primitive.
+            // The collider goes on a child of the physics body (to carry local transform).
             if (visualMesh != null)
             {
                 var mf = visualMesh.GetComponent<MeshFilter>();
                 if (mf != null && mf.sharedMesh != null)
                 {
-                    var mc = visualMesh.AddComponent<MeshCollider>();
+                    var colGo = new GameObject(geom.name + "_col");
+                    colGo.transform.SetParent(go.transform, false);
+                    colGo.transform.localPosition = visualMesh.transform.localPosition;
+                    colGo.transform.localRotation = visualMesh.transform.localRotation;
+                    colGo.transform.localScale = visualMesh.transform.localScale;
+                    var mc = colGo.AddComponent<MeshCollider>();
                     mc.sharedMesh = mf.sharedMesh;
                     mc.convex = true;
                     mc.material = physicsMat;
