@@ -1,0 +1,122 @@
+{
+  "add_g1_run": {
+    "file": "add_g1_run_actor.onnx",
+    "display_name": "ADD Unitree G1 - Run",
+    "agent_type": "add",
+    "obs_dim": 849,
+    "act_dim": 29,
+    "latent_dim": 0
+  },
+  "add_humanoid_spinkick": {
+    "file": "add_humanoid_spinkick_actor.onnx",
+    "display_name": "ADD Humanoid - Spinkick",
+    "agent_type": "add",
+    "obs_dim": 464,
+    "act_dim": 28,
+    "latent_dim": 0
+  },
+  "amp_humanoid_spinkick": {
+    "file": "amp_humanoid_spinkick_actor.onnx",
+    "display_name": "AMP Humanoid - Spinkick",
+    "agent_type": "amp",
+    "obs_dim": 140,
+    "act_dim": 28,
+    "latent_dim": 0
+  },
+  "amp_location_humanoid": {
+    "file": "amp_location_humanoid_actor.onnx",
+    "display_name": "AMP Humanoid - Location Task",
+    "agent_type": "amp",
+    "obs_dim": 142,
+    "act_dim": 28,
+    "latent_dim": 0
+  },
+  "amp_steering_humanoid": {
+    "file": "amp_steering_humanoid_actor.onnx",
+    "display_name": "AMP Humanoid - Steering Task",
+    "agent_type": "amp",
+    "obs_dim": 145,
+    "act_dim": 28,
+    "latent_dim": 0
+  },
+  "amp_steering_humanoid_sword_shield": {
+    "file": "amp_steering_humanoid_sword_shield_actor.onnx",
+    "display_name": "AMP Humanoid S&S - Steering",
+    "agent_type": "amp",
+    "obs_dim": 163,
+    "act_dim": 31,
+    "latent_dim": 0
+  },
+  "ase_humanoid_sword_shield": {
+    "file": "ase_humanoid_sword_shield_actor.onnx",
+    "display_name": "ASE Humanoid - Sword & Shield",
+    "agent_type": "ase",
+    "obs_dim": 158,
+    "act_dim": 31,
+    "latent_dim": 64
+  },
+  "deepmimic_g1_double_kong": {
+    "file": "deepmimic_g1_double_kong_actor.onnx",
+    "display_name": "DeepMimic Unitree G1 - Double Kong",
+    "agent_type": "ppo",
+    "obs_dim": 849,
+    "act_dim": 29,
+    "latent_dim": 0
+  },
+  "deepmimic_g1_spinkick": {
+    "file": "deepmimic_g1_spinkick_actor.onnx",
+    "display_name": "DeepMimic Unitree G1 - Spinkick",
+    "agent_type": "ppo",
+    "obs_dim": 849,
+    "act_dim": 29,
+    "latent_dim": 0
+  },
+  "deepmimic_go2_pace": {
+    "file": "deepmimic_go2_pace_actor.onnx",
+    "display_name": "DeepMimic Unitree Go2 - Pace",
+    "agent_type": "ppo",
+    "obs_dim": 484,
+    "act_dim": 12,
+    "latent_dim": 0
+  },
+  "deepmimic_humanoid_awr_spinkick": {
+    "file": "deepmimic_humanoid_awr_spinkick_actor.onnx",
+    "display_name": "DeepMimic Humanoid AWR - Spinkick",
+    "agent_type": "awr",
+    "obs_dim": 464,
+    "act_dim": 28,
+    "latent_dim": 0
+  },
+  "deepmimic_humanoid_spinkick": {
+    "file": "deepmimic_humanoid_spinkick_actor.onnx",
+    "display_name": "DeepMimic Humanoid - Spinkick",
+    "agent_type": "ppo",
+    "obs_dim": 464,
+    "act_dim": 28,
+    "latent_dim": 0
+  },
+  "deepmimic_pi_plus_walk": {
+    "file": "deepmimic_pi_plus_walk_actor.onnx",
+    "display_name": "DeepMimic Pi Plus - Walk",
+    "agent_type": "ppo",
+    "obs_dim": 662,
+    "act_dim": 22,
+    "latent_dim": 0
+  },
+  "deepmimic_smpl_spinkick": {
+    "file": "deepmimic_smpl_spinkick_actor.onnx",
+    "display_name": "DeepMimic SMPL - Spinkick",
+    "agent_type": "ppo",
+    "obs_dim": 721,
+    "act_dim": 69,
+    "latent_dim": 0
+  },
+  "lcp_g1_walk": {
+    "file": "lcp_g1_walk_actor.onnx",
+    "display_name": "LCP Unitree G1 - Walk",
+    "agent_type": "lcp",
+    "obs_dim": 849,
+    "act_dim": 29,
+    "latent_dim": 0
+  }
+}

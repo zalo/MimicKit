@@ -1,306 +1,484 @@
-"""Export ASE actor to ONNX using the actual agent model (no manual reconstruction).
+"""Export MimicKit actor models to ONNX for the web demo.
 
-This loads the full agent with its model, wraps the inference pipeline
-(obs_norm → actor → a_norm) into a single nn.Module, and exports it.
-This guarantees exact equivalence with PyTorch inference.
+Reconstructs the actor network directly from checkpoint weights — no env/engine needed.
+Supports all agent types: ASE (with latent input), AMP, ADD, DeepMimic/PPO, AWR, LCP.
+Bakes obs normalization, actor network, and action unnormalization into a single module.
+Also bakes MJCF XML + config metadata into the ONNX file for single-file deployment.
 
 Usage:
-    cd MimicKit
+    # Export a single model:
     python tools/export_onnx.py \
         --arg_file args/ase_humanoid_sword_shield_args.txt \
         --model_file data/models/ase_humanoid_sword_shield_model.pt \
         --output web/ase_humanoid_sword_shield_actor.onnx
+
+    # Export all pre-trained models in data/models/:
+    python tools/export_onnx.py --batch
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mimickit'))
-
 import argparse
+import json
+import re
 import numpy as np
 import torch
 import torch.nn as nn
+import yaml
+
+# ── Model-to-config mapping ─────────────────────────────────────────────────
+MODEL_CONFIGS = {
+    'ase_humanoid_sword_shield':             'args/ase_humanoid_sword_shield_args.txt',
+    'amp_humanoid_spinkick':                 'args/amp_humanoid_args.txt',
+    'amp_location_humanoid':                 'args/amp_location_humanoid_args.txt',
+    'amp_steering_humanoid':                 'args/amp_steering_humanoid_args.txt',
+    'amp_steering_humanoid_sword_shield':    'args/amp_steering_humanoid_sword_shield_args.txt',
+    'add_humanoid_spinkick':                 'args/add_humanoid_args.txt',
+    'add_g1_run':                            'args/add_g1_args.txt',
+    'deepmimic_humanoid_spinkick':           'args/deepmimic_humanoid_ppo_args.txt',
+    'deepmimic_humanoid_awr_spinkick':       'args/deepmimic_humanoid_awr_args.txt',
+    'deepmimic_go2_pace':                    'args/deepmimic_go2_ppo_args.txt',
+    'deepmimic_g1_double_kong':              'args/deepmimic_g1_ppo_args.txt',
+    'deepmimic_g1_spinkick':                 'args/deepmimic_g1_ppo_args.txt',
+    'deepmimic_pi_plus_walk':                'args/deepmimic_pi_plus_ppo_args.txt',
+    'deepmimic_smpl_spinkick':              'args/deepmimic_smpl_ppo_args.txt',
+    'lcp_g1_walk':                           'args/lcp_g1_ppo_args.txt',
+}
+
+MODEL_DISPLAY_NAMES = {
+    'ase_humanoid_sword_shield':             'ASE Humanoid - Sword & Shield',
+    'amp_humanoid_spinkick':                 'AMP Humanoid - Spinkick',
+    'amp_location_humanoid':                 'AMP Humanoid - Location Task',
+    'amp_steering_humanoid':                 'AMP Humanoid - Steering Task',
+    'amp_steering_humanoid_sword_shield':    'AMP Humanoid S&S - Steering',
+    'add_humanoid_spinkick':                 'ADD Humanoid - Spinkick',
+    'add_g1_run':                            'ADD Unitree G1 - Run',
+    'deepmimic_humanoid_spinkick':           'DeepMimic Humanoid - Spinkick',
+    'deepmimic_humanoid_awr_spinkick':       'DeepMimic Humanoid AWR - Spinkick',
+    'deepmimic_go2_pace':                    'DeepMimic Unitree Go2 - Pace',
+    'deepmimic_g1_double_kong':              'DeepMimic Unitree G1 - Double Kong',
+    'deepmimic_g1_spinkick':                 'DeepMimic Unitree G1 - Spinkick',
+    'deepmimic_pi_plus_walk':                'DeepMimic Pi Plus - Walk',
+    'deepmimic_smpl_spinkick':               'DeepMimic SMPL - Spinkick',
+    'lcp_g1_walk':                           'LCP Unitree G1 - Walk',
+}
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--arg_file', default='args/ase_humanoid_sword_shield_args.txt')
-parser.add_argument('--model_file', default='data/models/ase_humanoid_sword_shield_model.pt')
-parser.add_argument('--output', default='web/ase_humanoid_sword_shield_actor.onnx')
-parser.add_argument('--engine', default='data/engines/isaac_lab_engine.yaml',
-                    help='Engine config (only used to build env for model construction)')
-args = parser.parse_args()
+parser.add_argument('--arg_file', default=None)
+parser.add_argument('--model_file', default=None)
+parser.add_argument('--output', default=None)
+parser.add_argument('--batch', action='store_true',
+                    help='Export all pre-trained models in data/models/')
+parser.add_argument('--models_dir', default='data/models')
+parser.add_argument('--out_dir', default='web')
+cli_args = parser.parse_args()
 
 
-class ASEActorWrapper(nn.Module):
-    """Wraps the full agent inference pipeline into a single exportable module.
+# ── Helper: parse arg files to extract env/agent config paths ────────────────
 
-    Input:  raw_obs (B, obs_dim), latent (B, latent_dim)
-    Output: action  (B, act_dim)
+def parse_arg_file(arg_file):
+    """Parse a MimicKit args.txt file into a dict."""
+    result = {}
+    with open(arg_file) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('--'):
+                parts = line.split(None, 1)
+                key = parts[0].lstrip('-')
+                val = parts[1] if len(parts) > 1 else 'true'
+                result[key] = val
+    return result
 
-    Bakes in: obs normalization, actor network, action unnormalization.
+def load_yaml(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+# ── Reconstruct actor from checkpoint ────────────────────────────────────────
+
+def reconstruct_actor(ckpt):
+    """Reconstruct the actor MLP from checkpoint weight shapes.
+
+    Returns (actor_layers, mean_net, obs_dim, act_dim, latent_dim, is_ase).
     """
+    # Find actor layer keys and sort by index
+    actor_keys = sorted([k for k in ckpt if k.startswith('_model._actor_layers.')])
+    mean_w_key = '_model._action_dist._mean_net.weight'
+    mean_b_key = '_model._action_dist._mean_net.bias'
 
-    def __init__(self, agent):
+    # Detect ASE by presence of encoder
+    is_ase = any(k.startswith('_model._enc_') for k in ckpt)
+
+    obs_dim = int(ckpt['_obs_norm._mean'].shape[0])
+    act_dim = int(ckpt['_a_norm._mean'].shape[0])
+    latent_dim = int(ckpt['_model._enc_out.weight'].shape[0]) if is_ase else 0
+
+    # Build actor Sequential from weight shapes
+    # Keys like: _model._actor_layers.0.weight, _model._actor_layers.0.bias,
+    #            _model._actor_layers.2.weight, etc.
+    # Extract layer indices that have weights (= Linear layers)
+    prefix = '_model._actor_layers.'
+    weight_layers = []
+    for key in actor_keys:
+        if key.endswith('.weight'):
+            # e.g. "_model._actor_layers.0.weight" -> idx=0
+            local = key[len(prefix):]  # "0.weight"
+            idx = int(local.split('.')[0])
+            w = ckpt[key]
+            weight_layers.append((idx, w.shape[1], w.shape[0]))
+
+    weight_layers.sort(key=lambda x: x[0])
+
+    # Reconstruct Sequential: Linear + ReLU after EVERY linear layer (including last).
+    # MimicKit's net_builder always appends activation after each Linear.
+    sequential_layers = []
+    for i, (idx, in_f, out_f) in enumerate(weight_layers):
+        sequential_layers.append(nn.Linear(in_f, out_f))
+        sequential_layers.append(nn.ReLU())
+
+    actor_layers = nn.Sequential(*sequential_layers)
+    mean_net = nn.Linear(ckpt[mean_w_key].shape[1], act_dim)
+
+    # Load weights — map checkpoint keys to sequential indices
+    # The sequential has Linear at positions 0, 2, 4, ... and ReLU at 1, 3, 5, ...
+    # Checkpoint indices map directly (0, 2, 4, ... are Linear in the original Sequential)
+    actor_state = {}
+    for key in actor_keys:
+        local_key = key[len(prefix):]  # e.g. "0.weight", "2.bias"
+        # Remap the original indices to our sequential indices
+        parts = local_key.split('.')
+        orig_idx = int(parts[0])
+        # Find which position this layer is in our sorted weight_layers
+        seq_idx = None
+        for pos, (widx, _, _) in enumerate(weight_layers):
+            if widx == orig_idx:
+                seq_idx = pos * 2  # account for ReLU layers between Linear layers
+                break
+        if seq_idx is not None:
+            new_key = f'{seq_idx}.{parts[1]}'
+            actor_state[new_key] = ckpt[key]
+    actor_layers.load_state_dict(actor_state)
+
+    mean_net.weight.data = ckpt[mean_w_key]
+    mean_net.bias.data = ckpt[mean_b_key]
+
+    return actor_layers, mean_net, obs_dim, act_dim, latent_dim, is_ase
+
+
+class ActorWrapper(nn.Module):
+    """Unified wrapper for all agent types.
+
+    ASE: forward(obs, latent) → action
+    Others: forward(obs) → action
+    """
+    def __init__(self, ckpt, is_ase):
         super().__init__()
+        self.is_ase = is_ase
 
-        # Copy normalizer parameters as buffers
-        self.register_buffer('obs_mean', agent._obs_norm._mean.data.clone())
-        self.register_buffer('obs_std', agent._obs_norm._std.data.clone().clamp(min=1e-4))
-        self.obs_clip = agent._obs_norm._clip
+        self.register_buffer('obs_mean', ckpt['_obs_norm._mean'].clone())
+        self.register_buffer('obs_std', ckpt['_obs_norm._std'].clone().clamp(min=1e-4))
+        # obs_clip is always 10.0 in MimicKit
+        self.obs_clip = 10.0
 
-        self.register_buffer('a_mean', agent._a_norm._mean.data.clone())
-        self.register_buffer('a_std', agent._a_norm._std.data.clone().clamp(min=1e-4))
+        self.register_buffer('a_mean', ckpt['_a_norm._mean'].clone())
+        self.register_buffer('a_std', ckpt['_a_norm._std'].clone().clamp(min=1e-4))
 
-        # Reference the actual model layers (no reconstruction!)
-        self.actor_layers = agent._model._actor_layers
-        self.mean_net = agent._model._action_dist._mean_net
+        actor_layers, mean_net, obs_dim, act_dim, latent_dim, _ = reconstruct_actor(ckpt)
+        self.actor_layers = actor_layers
+        self.mean_net = mean_net
+        self._obs_dim = obs_dim
+        self._act_dim = act_dim
+        self._latent_dim = latent_dim
 
-    def forward(self, raw_obs: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-        # Normalize observation
-        norm_obs = (raw_obs - self.obs_mean) / self.obs_std
-        norm_obs = torch.clamp(norm_obs, -self.obs_clip, self.obs_clip)
-
-        # Concatenate obs + latent (same as ASEModel.eval_actor)
-        x = torch.cat([norm_obs, latent], dim=-1)
-
-        # Actor forward pass
+    def forward(self, raw_obs, latent=None):
+        norm_obs = torch.clamp((raw_obs - self.obs_mean) / self.obs_std,
+                               -self.obs_clip, self.obs_clip)
+        if self.is_ase and latent is not None:
+            x = torch.cat([norm_obs, latent], dim=-1)
+        else:
+            x = norm_obs
         h = self.actor_layers(x)
-        norm_action = self.mean_net(h)  # deterministic (mode) action
-
-        # Unnormalize action
-        action = norm_action * self.a_std + self.a_mean
-        return action
+        norm_action = self.mean_net(h)
+        return norm_action * self.a_std + self.a_mean
 
 
-def main():
-    # Need to build env + agent to get the actual model with correct architecture.
-    # We use a dummy engine config that doesn't require a GPU simulator.
-    # If Isaac Lab is available, use it; otherwise fall back to loading from checkpoint.
+def _exp_map_to_quat(exp_map):
+    """Convert exponential map [ex, ey, ez] to quaternion [x, y, z, w]."""
+    import math
+    ex, ey, ez = float(exp_map[0]), float(exp_map[1]), float(exp_map[2])
+    angle = math.sqrt(ex*ex + ey*ey + ez*ez)
+    if angle < 1e-8:
+        return [0.0, 0.0, 0.0, 1.0]
+    axis = [ex/angle, ey/angle, ez/angle]
+    half = angle / 2.0
+    s = math.sin(half)
+    return [axis[0]*s, axis[1]*s, axis[2]*s, math.cos(half)]
 
-    try:
-        # Try building via the full agent pipeline
-        from util.arg_parser import ArgParser
-        import util.mp_util as mp_util
-        import run as mimickit_run
 
-        mk_args = ArgParser()
-        mk_args.load_file(args.arg_file)
-        mk_args._table['engine_config'] = [args.engine]
-        mk_args._table['num_envs'] = ['1']
-        mk_args._table['mode'] = ['test']
-        mk_args._table['visualize'] = ['false']
+def detect_agent_type_from_config(agent_config_path):
+    """Detect agent type from the agent config YAML."""
+    cfg = load_yaml(agent_config_path)
+    name = cfg.get('agent_name', '').upper()
+    if name == 'ASE': return 'ase'
+    if name == 'ADD': return 'add'
+    if name == 'AMP': return 'amp'
+    if name == 'AWR': return 'awr'
+    if name == 'LCP': return 'lcp'
+    if name == 'PPO': return 'ppo'
+    return 'ppo'
 
-        mp_util.init(0, 1, 'cpu', None)
 
-        env = mimickit_run.build_env(mk_args, 1, 'cpu', False)
-        agent = mimickit_run.build_agent(mk_args, env, 'cpu')
-        agent.load(args.model_file)
-        agent.eval()
+def export_single(arg_file, model_file, output_path, model_basename=None):
+    """Export a single model to ONNX with baked metadata."""
+    print(f"\n{'='*70}")
+    print(f"Exporting: {model_file}")
+    print(f"  arg_file: {arg_file}")
+    print(f"  output:   {output_path}")
+    print(f"{'='*70}")
 
-        print(f"Agent loaded via full pipeline")
-        print(f"  obs_dim={agent._obs_norm._mean.shape[0]}")
-        print(f"  act_dim={agent._a_norm._mean.shape[0]}")
-        print(f"  latent_dim={agent._model._enc_out.weight.shape[0]}")
+    # Parse config files
+    args_dict = parse_arg_file(arg_file)
+    env_config_path = args_dict.get('env_config')
+    agent_config_path = args_dict.get('agent_config')
+    env_config = load_yaml(env_config_path) if env_config_path else {}
 
-    except Exception as e:
-        print(f"Failed to build via full pipeline: {e}")
-        print("Falling back to checkpoint-only export (same as export_onnx.py v1)")
-        # Fall back to v1 approach
-        from export_onnx import export_onnx
-        export_onnx(args.model_file, args.output)
-        return
+    agent_type = detect_agent_type_from_config(agent_config_path) if agent_config_path else 'ppo'
 
-    # Create wrapper
-    wrapper = ASEActorWrapper(agent)
+    # Load checkpoint
+    ckpt = torch.load(model_file, map_location='cpu', weights_only=False)
+
+    # Check if ASE from checkpoint structure (more reliable than config)
+    is_ase = any(k.startswith('_model._enc_') for k in ckpt)
+    if is_ase:
+        agent_type = 'ase'
+
+    # Reconstruct and wrap
+    wrapper = ActorWrapper(ckpt, is_ase)
     wrapper.eval()
 
-    obs_dim = wrapper.obs_mean.shape[0]
-    latent_dim = agent._model._enc_out.weight.shape[0]
-    act_dim = wrapper.a_mean.shape[0]
+    obs_dim = wrapper._obs_dim
+    act_dim = wrapper._act_dim
+    latent_dim = wrapper._latent_dim
 
-    print(f"\nExporting: raw_obs({obs_dim}) + latent({latent_dim}) → action({act_dim})")
+    print(f"  agent_type={agent_type}, obs_dim={obs_dim}, act_dim={act_dim}, latent_dim={latent_dim}")
 
-    # Dummy inputs
+    # Export to ONNX
     dummy_obs = torch.randn(1, obs_dim)
-    dummy_z = torch.randn(1, latent_dim)
 
-    # PyTorch reference
-    with torch.no_grad():
-        pt_action = wrapper(dummy_obs, dummy_z)
-    print(f"PyTorch output: {pt_action[0, :5].numpy()}")
+    if is_ase:
+        dummy_z = torch.randn(1, latent_dim)
+        with torch.no_grad():
+            pt_action = wrapper(dummy_obs, dummy_z)
 
-    # Export
-    torch.onnx.export(
-        wrapper,
-        (dummy_obs, dummy_z),
-        args.output,
-        input_names=["obs", "latent"],
-        output_names=["action"],
-        dynamic_axes={
-            "obs": {0: "batch"},
-            "latent": {0: "batch"},
-            "action": {0: "batch"},
-        },
-        opset_version=17,
-    )
-    print(f"Exported to {args.output}")
+        torch.onnx.export(
+            wrapper, (dummy_obs, dummy_z), output_path,
+            input_names=["obs", "latent"], output_names=["action"],
+            dynamic_axes={"obs": {0: "batch"}, "latent": {0: "batch"}, "action": {0: "batch"}},
+            opset_version=17,
+        )
 
-    # Verify
-    import onnxruntime as ort
-    sess = ort.InferenceSession(args.output)
-    ort_inputs = {"obs": dummy_obs.numpy(), "latent": dummy_z.numpy()}
-    ort_action = sess.run(["action"], ort_inputs)[0]
+        import onnxruntime as ort
+        sess = ort.InferenceSession(output_path)
+        ort_action = sess.run(["action"], {"obs": dummy_obs.numpy(), "latent": dummy_z.numpy()})[0]
+    else:
+        with torch.no_grad():
+            pt_action = wrapper(dummy_obs)
+
+        # For non-ASE, forward signature is just (obs,)
+        class SimpleForward(nn.Module):
+            def __init__(self, w):
+                super().__init__()
+                self.w = w
+            def forward(self, obs):
+                return self.w(obs)
+
+        simple = SimpleForward(wrapper)
+        simple.eval()
+
+        torch.onnx.export(
+            simple, (dummy_obs,), output_path,
+            input_names=["obs"], output_names=["action"],
+            dynamic_axes={"obs": {0: "batch"}, "action": {0: "batch"}},
+            opset_version=17,
+        )
+
+        import onnxruntime as ort
+        sess = ort.InferenceSession(output_path)
+        ort_action = sess.run(["action"], {"obs": dummy_obs.numpy()})[0]
 
     max_diff = np.max(np.abs(pt_action.numpy() - ort_action))
-    print(f"ONNX output: {ort_action[0, :5]}")
-    print(f"Max diff: {max_diff:.2e}")
+    print(f"  PyTorch vs ONNX max_diff: {max_diff:.2e}")
     assert max_diff < 1e-3, f"ONNX diverges: {max_diff}"
 
-    # Verify with real-ish obs
-    print("\nVerifying with agent's actual inference...")
-    test_obs = torch.randn(1, obs_dim)
-    test_z = torch.randn(1, latent_dim)
-    test_z = test_z / test_z.norm(dim=-1, keepdim=True)
-
-    with torch.no_grad():
-        # Agent path
-        norm_obs = agent._obs_norm.normalize(test_obs)
-        dist = agent._model.eval_actor(norm_obs, test_z)
-        agent_action = agent._a_norm.unnormalize(dist.mode)
-
-        # Wrapper path
-        wrapper_action = wrapper(test_obs, test_z)
-
-        # ONNX path
-        ort_action2 = sess.run(["action"], {
-            "obs": test_obs.numpy(),
-            "latent": test_z.numpy()
-        })[0]
-
-    agent_np = agent_action.numpy()
-    wrapper_np = wrapper_action.numpy()
-    print(f"Agent action[:5]:   {agent_np[0,:5]}")
-    print(f"Wrapper action[:5]: {wrapper_np[0,:5]}")
-    print(f"ONNX action[:5]:    {ort_action2[0,:5]}")
-    print(f"Agent vs Wrapper max_diff: {np.max(np.abs(agent_np - wrapper_np)):.2e}")
-    print(f"Agent vs ONNX max_diff:    {np.max(np.abs(agent_np - ort_action2)):.2e}")
-    print(f"Wrapper vs ONNX max_diff:  {np.max(np.abs(wrapper_np - ort_action2)):.2e}")
-
-    # Bake model metadata into ONNX for the web demo.
-    # This eliminates the need for a separate JSON config file.
+    # ── Bake metadata ────────────────────────────────────────────────────────
     import onnx
-    model = onnx.load(args.output)
+    model = onnx.load(output_path)
 
-    # Collect metadata from agent
     meta = {}
-    meta['obs_dim'] = int(obs_dim)
-    meta['act_dim'] = int(act_dim)
-    meta['latent_dim'] = int(latent_dim)
+    meta['agent_type'] = agent_type
+    meta['obs_dim'] = obs_dim
+    meta['act_dim'] = act_dim
+    meta['latent_dim'] = latent_dim
+    if model_basename:
+        meta['model_name'] = model_basename
+        meta['display_name'] = MODEL_DISPLAY_NAMES.get(model_basename, model_basename)
     meta['obs_mean'] = wrapper.obs_mean.numpy().tolist()
     meta['obs_std'] = wrapper.obs_std.numpy().tolist()
     meta['a_mean'] = wrapper.a_mean.numpy().tolist()
     meta['a_std'] = wrapper.a_std.numpy().tolist()
 
-    # Action bounds from agent config
-    if hasattr(agent, '_action_low') and agent._action_low is not None:
-        meta['action_low'] = agent._action_low.cpu().numpy().tolist()
-        meta['action_high'] = agent._action_high.cpu().numpy().tolist()
+    # Extract env config metadata
+    char_file = env_config.get('char_file')
+    init_pose = env_config.get('init_pose')
+    global_obs = env_config.get('global_obs', False)
+    key_bodies = env_config.get('key_bodies', [])
 
-    # Init pose and env config — try env attributes, fall back to existing JSON
-    json_fallback = {}
-    json_path = os.path.join(os.path.dirname(args.output), 'humanoid_data.json')
-    if os.path.isfile(json_path):
-        import json as _json
-        json_fallback = _json.load(open(json_path))
-        print(f"  Loaded JSON fallback from {json_path}")
+    if init_pose and isinstance(init_pose, list) and len(init_pose) > 6:
+        # MimicKit init_pose format: [x, y, z, exp_x, exp_y, exp_z, dof0, dof1, ...]
+        # [0:3] = root position, [3:6] = root rotation as exp map, [6:] = joint DOFs
+        meta['init_root_pos'] = init_pose[:3]
+        # Convert exp map to quaternion
+        exp_map = init_pose[3:6]
+        meta['init_root_rot_quat'] = _exp_map_to_quat(exp_map)
+        meta['init_dof_pos'] = init_pose[6:]
 
-    def _try_tensor(obj, attr, idx=0):
-        """Extract a list from a tensor attribute, handling 1D and 2D tensors."""
-        t = getattr(obj, attr, None)
-        if t is None: return None
-        t = t.cpu()
-        if t.dim() > 1: t = t[idx]
-        return t.numpy().flatten().tolist()
+    meta['global_obs'] = bool(global_obs)
 
-    # Init pose
-    init_dof = _try_tensor(env, '_init_dof_pos') or json_fallback.get('init_dof_pos')
-    init_root_pos = _try_tensor(env, '_init_root_pos') or json_fallback.get('init_root_pos')
-    init_root_rot = _try_tensor(env, '_init_root_rot') or json_fallback.get('init_root_rot_quat')
-    if init_dof and isinstance(init_dof, list) and len(init_dof) > 1:
-        meta['init_dof_pos'] = init_dof
-    if init_root_pos and isinstance(init_root_pos, list) and len(init_root_pos) == 3:
-        meta['init_root_pos'] = init_root_pos
-    if init_root_rot and isinstance(init_root_rot, list) and len(init_root_rot) == 4:
-        meta['init_root_rot_quat'] = init_root_rot
-
-    # Action bounds
-    action_low = _try_tensor(agent, '_action_low') or json_fallback.get('action_low')
-    action_high = _try_tensor(agent, '_action_high') or json_fallback.get('action_high')
-    if action_low: meta['action_low'] = action_low
-    if action_high: meta['action_high'] = action_high
-
-    # Key body IDs and settings
-    key_ids = _try_tensor(env, '_key_body_ids') or json_fallback.get('key_body_ids')
-    if key_ids: meta['key_body_ids'] = [int(x) for x in key_ids]
-    meta['global_obs'] = bool(getattr(env, '_global_obs', json_fallback.get('global_obs', False)))
-    meta['pelvis_z'] = float(getattr(env, '_pelvis_z', json_fallback.get('pelvis_z', 0.703)))
-    meta['tpose_pelvis_z'] = float(getattr(env, '_tpose_pelvis_z', json_fallback.get('tpose_pelvis_z', 0.903)))
-
-    # Bake MJCF XML into metadata so the ONNX is a single-file character kit
-    mjcf_path = getattr(env, '_char_file', None) or json_fallback.get('mjcf_file')
-    # Also try the arg_file's char_file
-    if not mjcf_path:
-        try:
-            mjcf_path = mk_args.parse_string('char_file')
-        except: pass
-    # Try common locations
-    if not mjcf_path or not os.path.isfile(mjcf_path):
-        for candidate in [
-            'data/assets/sword_shield/humanoid_sword_shield.xml',
-            os.path.join(os.path.dirname(args.output), 'humanoid_sword_shield.xml'),
-        ]:
-            if os.path.isfile(candidate):
-                mjcf_path = candidate
-                break
-    if mjcf_path and os.path.isfile(mjcf_path):
-        with open(mjcf_path) as f:
+    # Bake MJCF XML
+    if char_file and os.path.isfile(char_file):
+        with open(char_file) as f:
             meta['mjcf_xml'] = f.read()
-        print(f"  Baked MJCF from {mjcf_path} ({len(meta['mjcf_xml'])} chars)")
+        print(f"  Baked MJCF from {char_file} ({len(meta['mjcf_xml'])} chars)")
 
-    # Write ALL metadata as a single JSON blob under a sentinel key.
-    # This allows the web demo to find it by scanning the raw ONNX bytes
-    # (onnxruntime-web doesn't expose metadata via its JS API).
-    import json
+    # Compute pelvis_z and tpose_pelvis_z from init_pose
+    if init_pose and len(init_pose) >= 3:
+        meta['pelvis_z'] = float(init_pose[2])
+        # T-pose pelvis is typically ~0.2m higher than init pose for humanoid characters
+        # This is used for positioning during articulation construction
+        meta['tpose_pelvis_z'] = float(init_pose[2]) + 0.2
+
+    # For key_body_ids, we need to map body names to indices from the MJCF
+    # This requires parsing the MJCF to get body order
+    if char_file and os.path.isfile(char_file) and key_bodies:
+        body_names = _extract_body_names(char_file)
+        key_ids = []
+        for name in key_bodies:
+            if name in body_names:
+                key_ids.append(body_names.index(name))
+            else:
+                print(f"  WARNING: key body '{name}' not found in MJCF")
+        if key_ids:
+            meta['key_body_ids'] = key_ids
+
+    # Write metadata
     sentinel_key = 'mimickit_config'
-    config_json = json.dumps(meta, separators=(',', ':'))  # compact
-    entry = onnx.StringStringEntryProto(key=sentinel_key, value=config_json)
-    model.metadata_props.append(entry)
-    # Also write individual entries for tools that read metadata normally
+    config_json = json.dumps(meta, separators=(',', ':'))
+    model.metadata_props.append(onnx.StringStringEntryProto(key=sentinel_key, value=config_json))
     for key, value in meta.items():
-        if key == 'mjcf_xml': continue  # already in the blob
-        entry = onnx.StringStringEntryProto(key=key, value=json.dumps(value))
-        model.metadata_props.append(entry)
+        if key == 'mjcf_xml':
+            continue
+        model.metadata_props.append(onnx.StringStringEntryProto(key=key, value=json.dumps(value)))
 
-    onnx.save(model, args.output, save_as_external_data=False)
-    print(f"\nBaked {len(meta)} metadata entries into ONNX:")
-    for k in sorted(meta.keys()):
-        v = meta[k]
-        if isinstance(v, list) and len(v) > 5:
-            print(f"  {k}: [{v[0]:.4f}, ... {len(v)} items]")
-        else:
-            print(f"  {k}: {v}")
+    onnx.save(model, output_path, save_as_external_data=False)
 
-    # Check file size
-    size_mb = os.path.getsize(args.output) / (1024 * 1024)
-    print(f"\nOutput file: {args.output} ({size_mb:.1f} MB)")
-
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
     if size_mb < 0.1:
-        print("WARNING: File is very small — weights may be stored externally in .onnx.data file")
-        print("Re-saving with all weights internal...")
-        import onnx
-        model = onnx.load(args.output)
-        onnx.save(model, args.output, save_as_external_data=False)
-        size_mb = os.path.getsize(args.output) / (1024 * 1024)
-        print(f"Re-saved: {args.output} ({size_mb:.1f} MB)")
+        print("  WARNING: File very small — re-saving with internal weights...")
+        model = onnx.load(output_path)
+        onnx.save(model, output_path, save_as_external_data=False)
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
 
-    print("\nPASS: All verifications passed.")
+    print(f"  Output: {output_path} ({size_mb:.1f} MB)")
+    print(f"  Metadata: {len(meta)} keys ({len(config_json)} bytes)")
+    return meta
+
+
+def _extract_body_names(mjcf_path):
+    """Extract body names in DFS order from MJCF XML."""
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(mjcf_path)
+    root = tree.getroot()
+    worldbody = root.find('worldbody')
+
+    names = []
+    def visit(elem):
+        name = elem.get('name')
+        if name:
+            names.append(name)
+        for child in elem.findall('body'):
+            visit(child)
+
+    for body in worldbody.findall('body'):
+        visit(body)
+    return names
+
+
+def main():
+    if cli_args.batch:
+        models_dir = cli_args.models_dir
+        out_dir = cli_args.out_dir
+        os.makedirs(out_dir, exist_ok=True)
+
+        pt_files = sorted(f for f in os.listdir(models_dir) if f.endswith('_model.pt'))
+        if not pt_files:
+            print(f"No *_model.pt files found in {models_dir}")
+            return
+
+        print(f"Found {len(pt_files)} models to export:")
+        for f in pt_files:
+            print(f"  {f}")
+
+        manifest = {}
+        failed = []
+
+        for pt_file in pt_files:
+            basename = pt_file.replace('_model.pt', '')
+            arg_file = MODEL_CONFIGS.get(basename)
+            if not arg_file:
+                print(f"\n  SKIP: No arg_file mapping for '{basename}'")
+                failed.append((basename, 'no arg_file mapping'))
+                continue
+            if not os.path.isfile(arg_file):
+                print(f"\n  SKIP: arg_file not found: {arg_file}")
+                failed.append((basename, f'arg_file missing: {arg_file}'))
+                continue
+
+            model_file = os.path.join(models_dir, pt_file)
+            output_path = os.path.join(out_dir, f'{basename}_actor.onnx')
+
+            try:
+                meta = export_single(arg_file, model_file, output_path,
+                                     model_basename=basename)
+                manifest[basename] = {
+                    'file': f'{basename}_actor.onnx',
+                    'display_name': MODEL_DISPLAY_NAMES.get(basename, basename),
+                    'agent_type': meta['agent_type'],
+                    'obs_dim': meta['obs_dim'],
+                    'act_dim': meta['act_dim'],
+                    'latent_dim': meta['latent_dim'],
+                }
+            except Exception as e:
+                print(f"\n  FAILED: {basename}: {e}")
+                import traceback
+                traceback.print_exc()
+                failed.append((basename, str(e)))
+
+        manifest_path = os.path.join(out_dir, 'models.json')
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+        print(f"\n{'='*70}")
+        print(f"Manifest written to {manifest_path}")
+        print(f"  Exported: {len(manifest)}/{len(pt_files)}")
+        if failed:
+            print(f"  Failed ({len(failed)}):")
+            for name, reason in failed:
+                print(f"    {name}: {reason}")
+        print(f"{'='*70}")
+
+    else:
+        arg_file = cli_args.arg_file or 'args/ase_humanoid_sword_shield_args.txt'
+        model_file = cli_args.model_file or 'data/models/ase_humanoid_sword_shield_model.pt'
+        output = cli_args.output or 'web/ase_humanoid_sword_shield_actor.onnx'
+        export_single(arg_file, model_file, output)
+        print("\nPASS: All verifications passed.")
 
 
 if __name__ == "__main__":
