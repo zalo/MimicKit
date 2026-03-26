@@ -57,9 +57,9 @@ public class MimicKitController : MonoBehaviour
     [Tooltip("Check to reset the humanoid to its initial pose")]
     public bool reset;
 
-    [Tooltip("Lock the Y axis (up) to prevent the humanoid from jumping/falling")]
-    public bool lockYAxis;
-    bool lastLockYAxis;
+    [Tooltip("Lock the Z axis (forward) to keep the humanoid in place (matches web demo's Lock Y in Z-up)")]
+    public bool lockZAxis;
+    bool lastLockZAxis;
 
     // --- Parsed metadata ---
     MimicKitConfig config;
@@ -152,10 +152,10 @@ public class MimicKitController : MonoBehaviour
         }
 
         // Lock Y axis toggle
-        if (lockYAxis != lastLockYAxis)
+        if (lockZAxis != lastLockZAxis)
         {
-            lastLockYAxis = lockYAxis;
-            if (lockYAxis) EnableYConstraint();
+            lastLockZAxis = lockZAxis;
+            if (lockZAxis) EnableYConstraint();
             else DisableYConstraint();
         }
 
@@ -202,7 +202,7 @@ public class MimicKitController : MonoBehaviour
         DisableYConstraint();
         ApplyInitPose();
         ApplySkillPreset(skillPreset);
-        if (lockYAxis) EnableYConstraint();
+        if (lockZAxis) EnableYConstraint();
     }
 
     void EnableYConstraint()
@@ -219,8 +219,8 @@ public class MimicKitController : MonoBehaviour
         yConstraintJoint = anchorGo.AddComponent<ConfigurableJoint>();
         yConstraintJoint.connectedArticulationBody = rootBody;
         yConstraintJoint.xMotion = ConfigurableJointMotion.Free;
-        yConstraintJoint.yMotion = ConfigurableJointMotion.Locked;
-        yConstraintJoint.zMotion = ConfigurableJointMotion.Free;
+        yConstraintJoint.yMotion = ConfigurableJointMotion.Free;
+        yConstraintJoint.zMotion = ConfigurableJointMotion.Locked;
         yConstraintJoint.angularXMotion = ConfigurableJointMotion.Free;
         yConstraintJoint.angularYMotion = ConfigurableJointMotion.Free;
         yConstraintJoint.angularZMotion = ConfigurableJointMotion.Free;
