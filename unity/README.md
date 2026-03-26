@@ -41,10 +41,10 @@ At runtime, `MimicKitController`:
 ## PhysX Settings
 
 The `ProjectSettings/DynamicsManager.asset` configures PhysX to match Isaac Lab training:
-- **Solver**: TGS (solverType: 1)
+- **Solver**: PGS (solverType: 0, matching Isaac Lab default)
 - **Gravity**: -9.81 Y
 - **Fixed Timestep**: 1/120s (TimeManager.asset)
-- **Solver Iterations**: 16 position, 4 velocity
+- **Solver Iterations**: 4 position, 0 velocity (matching Isaac Lab scene caps)
 - **Bounce Threshold**: 0.2
 - **Sleep Threshold**: 5e-5
 - **Friction**: Patch friction

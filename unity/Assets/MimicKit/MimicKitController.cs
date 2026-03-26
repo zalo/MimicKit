@@ -57,6 +57,10 @@ public class MimicKitController : MonoBehaviour
     [Tooltip("Check to reset the humanoid to its initial pose")]
     public bool reset;
 
+    [Tooltip("Lock the Y axis (up) to prevent the humanoid from jumping/falling")]
+    public bool lockYAxis;
+    bool lastLockYAxis;
+
     // --- Parsed metadata ---
     MimicKitConfig config;
     MJCFData mjcf;
@@ -68,6 +72,9 @@ public class MimicKitController : MonoBehaviour
 
     // --- Physics material (matching Isaac Lab: friction=1, restitution=0) ---
     PhysicsMaterial physicsMat;
+
+    // --- Y-axis lock via ConfigurableJoint ---
+    ConfigurableJoint yConstraintJoint;
 
     // --- Inference ---
     Model model;
@@ -144,6 +151,14 @@ public class MimicKitController : MonoBehaviour
             ApplySkillPreset(skillPreset);
         }
 
+        // Lock Y axis toggle
+        if (lockYAxis != lastLockYAxis)
+        {
+            lastLockYAxis = lockYAxis;
+            if (lockYAxis) EnableYConstraint();
+            else DisableYConstraint();
+        }
+
         // Interpolate visual body transforms toward physics poses.
         // ArticulationBody doesn't support built-in interpolation, so we
         // lerp the visuals between FixedUpdate poses at the render rate.
@@ -184,8 +199,40 @@ public class MimicKitController : MonoBehaviour
 
     void ResetHumanoid()
     {
+        DisableYConstraint();
         ApplyInitPose();
         ApplySkillPreset(skillPreset);
+        if (lockYAxis) EnableYConstraint();
+    }
+
+    void EnableYConstraint()
+    {
+        if (yConstraintJoint != null || rootBody == null) return;
+
+        // Create a static anchor at the root's current position
+        var anchorGo = new GameObject("YConstraintAnchor");
+        anchorGo.transform.position = rootBody.transform.position;
+        var anchorRb = anchorGo.AddComponent<Rigidbody>();
+        anchorRb.isKinematic = true;
+
+        // ConfigurableJoint locks the Y (up) axis while leaving X/Z free
+        yConstraintJoint = anchorGo.AddComponent<ConfigurableJoint>();
+        yConstraintJoint.connectedArticulationBody = rootBody;
+        yConstraintJoint.xMotion = ConfigurableJointMotion.Free;
+        yConstraintJoint.yMotion = ConfigurableJointMotion.Locked;
+        yConstraintJoint.zMotion = ConfigurableJointMotion.Free;
+        yConstraintJoint.angularXMotion = ConfigurableJointMotion.Free;
+        yConstraintJoint.angularYMotion = ConfigurableJointMotion.Free;
+        yConstraintJoint.angularZMotion = ConfigurableJointMotion.Free;
+    }
+
+    void DisableYConstraint()
+    {
+        if (yConstraintJoint != null)
+        {
+            Destroy(yConstraintJoint.gameObject);
+            yConstraintJoint = null;
+        }
     }
 
     // ===== Model Loading =====
@@ -300,13 +347,14 @@ public class MimicKitController : MonoBehaviour
                 ab.centerOfMass = ZupToYup(body.com);
 
             // Match Isaac Lab rigid body properties
+            // Isaac Lab scene caps: maxPositionIterationCount=4, maxVelocityIterationCount=0
             ab.linearDamping = 0.0f;
             ab.angularDamping = 0.01f;
             ab.maxDepenetrationVelocity = 10f;
             ab.maxLinearVelocity = 1000f;
             ab.maxAngularVelocity = 1000f;
-            ab.solverIterations = 16;
-            ab.solverVelocityIterations = 4;
+            ab.solverIterations = 4;
+            ab.solverVelocityIterations = 0;
             ab.sleepThreshold = 5e-5f;
 
             // Add colliders to physics body, visual meshes to a separate interpolated container
@@ -644,37 +692,15 @@ public class MimicKitController : MonoBehaviour
         float[] dofVel = ReadDofVelocities();
         for (int i = 0; i < dofVel.Length; i++) obs[idx++] = dofVel[i];
 
-        // Key body positions via FK
-        if (mjcf.fk_parent_indices != null)
+        // Key body positions from PhysX link world positions.
+        // Isaac Lab's _compute_obs uses engine.get_body_pos() which reads PhysX link
+        // poses directly — NOT forward kinematics from DOF positions.
         {
-            int numBodies = mjcf.fk_parent_indices.Length;
-            float[][] fkPos = new float[numBodies][];
-            float[][] fkRot = new float[numBodies][];
-            fkPos[0] = rootPos;
-            fkRot[0] = rootRot;
-
-            for (int j = 1; j < numBodies; j++)
-            {
-                float[] jRot = jointRotQuats[j - 1];
-                float[] localTrans = mjcf.fk_local_translations[j];
-                float[] localRotFK = mjcf.fk_local_rotations[j];
-                int parentIdx = mjcf.fk_parent_indices[j];
-
-                float[] worldTrans = QuatRotateVec(fkRot[parentIdx], localTrans);
-                fkPos[j] = new float[]
-                {
-                    fkPos[parentIdx][0] + worldTrans[0],
-                    fkPos[parentIdx][1] + worldTrans[1],
-                    fkPos[parentIdx][2] + worldTrans[2]
-                };
-                float[] localCombined = QuatMul(localRotFK, jRot);
-                fkRot[j] = QuatMul(fkRot[parentIdx], localCombined);
-            }
-
             int[] keyIds = config.key_body_ids;
             foreach (int bid in keyIds)
             {
-                float[] bp = fkPos[bid];
+                // Read link world position, convert to Z-up for the policy
+                float[] bp = YupToZup(bodyEntries[bid].body.transform.position);
                 float[] rel = { bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2] };
                 float[] lr2 = config.global_obs ? rel : QuatRotateVec(headingInv, rel);
                 obs[idx++] = lr2[0]; obs[idx++] = lr2[1]; obs[idx++] = lr2[2];
