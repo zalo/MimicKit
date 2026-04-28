@@ -26,6 +26,9 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
     elif (env_name == "add"):
         import envs.add_env as add_env
         env = add_env.ADDEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+    elif (env_name == "smp"):
+        import envs.smp_env as smp_env
+        env = smp_env.SMPEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
     elif (env_name == "char_dof_test"):
         import envs.char_dof_test_env as char_dof_test_env
         env = char_dof_test_env.CharDofTestEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize)
@@ -38,6 +41,9 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
     elif (env_name == "task_steering"):
         import envs.task_steering_env as task_steering_env
         env = task_steering_env.TaskSteeringEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+    elif (env_name == "task_dodgeball"):
+        import envs.task_dodgeball_env as task_dodgeball_env
+        env = task_dodgeball_env.TaskDodgeballEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
     elif (env_name == "static_objects"):
         import envs.static_objects_env as static_objects_env
         env = static_objects_env.StaticObjectsEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)

@@ -128,7 +128,8 @@ class IsaacLabEngine(engine.Engine):
         Logger.print("Initializing simulation...")
         self._sim.reset()
         
-        self._build_order_tensors()
+        self._build_body_order_tensors()
+        self._build_sensor_order_tensors()
         self._build_sim_tensors()
         return
     
@@ -239,6 +240,10 @@ class IsaacLabEngine(engine.Engine):
     def get_num_envs(self):
         return self._env_offsets.shape[0]
     
+    def get_gravity(self):
+        gravity = np.array(self._sim.cfg.gravity)
+        return gravity
+    
     def get_objs_per_env(self):
         return len(self._obj_cfgs[0])
     
@@ -327,12 +332,18 @@ class IsaacLabEngine(engine.Engine):
     def get_contact_forces(self, obj_id):
         sensor = self._ground_contact_sensors[obj_id]
         forces = sensor.data.net_forces_w
+
+        body_order_sim2common = self._sensor_body_order_sim2common[obj_id]
+        forces = forces[:, body_order_sim2common, :]
         return forces
     
     def get_ground_contact_forces(self, obj_id):
         sensor = self._ground_contact_sensors[obj_id]
         forces = sensor.data.force_matrix_w
         forces = forces.sum(dim=-2)
+
+        body_order_sim2common = self._sensor_body_order_sim2common[obj_id]
+        forces = forces[:, body_order_sim2common, :]
         return forces
     
     def set_root_pos(self, env_id, obj_id, root_pos):
@@ -529,7 +540,7 @@ class IsaacLabEngine(engine.Engine):
         body_names = meta_data.link_names
         sim_body_id = body_names.index(body_name)
         body_id = self._body_order_common2sim[obj_id][sim_body_id]
-        return  body_id
+        return body_id
     
     def get_obj_type(self, obj_id):
         obj_type = self._obj_cfgs[0][obj_id].obj_type
@@ -879,7 +890,8 @@ class IsaacLabEngine(engine.Engine):
         usd_asset_file = self._parse_usd_path(obj_cfg.asset_file)
         usd_cfg = sim_utils.UsdFileCfg(usd_path=usd_asset_file, 
                                        visual_material=visual_material, 
-                                       rigid_props=rigid_props)
+                                       rigid_props=rigid_props,
+                                       activate_contact_sensors=True)
         
         prim_path = OBJ_PATH_TEMPLATE.format(env_id, obj_id)
         init_state = RigidObjectCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot)
@@ -1012,7 +1024,7 @@ class IsaacLabEngine(engine.Engine):
         sim_utils.schemas.modify_collision_properties(prim_path, collision_props)
         return
     
-    def _build_order_tensors(self):
+    def _build_body_order_tensors(self):
         self._body_order_sim2common = []
         self._body_order_common2sim = []
         self._dof_order_sim2common = []
@@ -1040,6 +1052,28 @@ class IsaacLabEngine(engine.Engine):
             self._dof_order_sim2common.append(dof_order_sim2common)
             self._dof_order_common2sim.append(dof_order_common2sim)
 
+        return
+
+    def _build_sensor_order_tensors(self):
+        self._sensor_body_order_sim2common = []
+
+        objs_per_env = self.get_objs_per_env()
+        for obj_id in range(objs_per_env):
+            sensor = self._ground_contact_sensors[obj_id]
+            if (sensor is not None):
+                obj_type = self.get_obj_type(obj_id)
+                if (obj_type == engine.ObjType.articulated):
+                    body_names = sensor.body_names
+                    body_common2sim = [self.find_obj_body_id(obj_id, name) for name in body_names]
+                    body_sim2common = [body_common2sim.index(i) for i in range(len(body_common2sim))]
+
+                    body_sim2common = torch.tensor(body_sim2common, device=self._device, dtype=torch.long)
+                    self._sensor_body_order_sim2common.append(body_sim2common)
+                else:
+                    body_sim2common = torch.tensor([0], device=self._device, dtype=torch.long)
+                    self._sensor_body_order_sim2common.append(body_sim2common)
+            else:
+                self._sensor_body_order_sim2common.append(None)
         return
     
     def _build_ground_contact_sensors(self):

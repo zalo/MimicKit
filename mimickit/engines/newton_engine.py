@@ -373,6 +373,7 @@ class NewtonEngine(engine.Engine):
         num_envs = self.get_num_envs()
         self._sim_state = SimState(self._sim_model, num_envs)
         self._state_swap_buffer = self._sim_model.state()
+        self._gravity = self._sim_model.gravity.numpy()[0]
 
         self._apply_start_xform()
 
@@ -501,6 +502,9 @@ class NewtonEngine(engine.Engine):
     
     def get_num_envs(self):
         return self._num_envs
+    
+    def get_gravity(self):
+        return self._gravity
     
     def get_objs_per_env(self):
         return len(self._sim_state.root_pos)
@@ -1077,7 +1081,7 @@ class NewtonEngine(engine.Engine):
         return
     
     def _update_contact_sensors(self):
-        self._ground_contact_sensor.update(self._contacts)
+        self._ground_contact_sensor.update(self._sim_state.raw_state, self._contacts)
         return
     
     def _visualize(self):

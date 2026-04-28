@@ -23,6 +23,9 @@ def build_agent(agent_file, env, device):
     elif (agent_name == "AMP"):
         import learning.amp_agent as amp_agent
         agent = amp_agent.AMPAgent(config=agent_config, env=env, device=device)
+    elif (agent_name == "SMP"):
+        import learning.smp_agent as smp_agent
+        agent = smp_agent.SMPAgent(config=agent_config, env=env, device=device)
     elif (agent_name == "ASE"):
         import learning.ase_agent as ase_agent
         agent = ase_agent.ASEAgent(config=agent_config, env=env, device=device)

@@ -1,12 +1,12 @@
 import torch
 import numpy as np
 
-import envs.amp_env as amp_env
+import envs.smp_env as smp_env
 import engines.engine as engine
 import util.torch_util as torch_util
 
 
-class TaskSteeringEnv(amp_env.AMPEnv):
+class TaskSteeringEnv(smp_env.SMPEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
         self._rand_tar_dir = env_config.get("rand_tar_dir", True)
         self._rand_face_dir = env_config.get("rand_face_dir", True)
@@ -294,5 +294,5 @@ def compute_steering_reward(root_pos, prev_root_pos, root_rot, tar_dir, tar_spee
     face_reward = torch.clamp_min(face_err, 0.0)
 
     reward = tar_reward_w * tar_reward + face_reward_w * face_reward
-
+    
     return reward

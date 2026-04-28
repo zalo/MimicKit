@@ -5,12 +5,13 @@ import util.mp_util as mp_util
 from util.logger import Logger
 
 class Normalizer(torch.nn.Module):
-    def __init__(self, shape, device, init_mean=None, init_std=None, min_std=1e-4, clip=np.inf, dtype=torch.float):
+    def __init__(self, shape, device, init_mean=None, init_std=None, min_std=1e-4, clip=np.inf, dtype=torch.float, std_clip=None):
         super().__init__()
         
         self._min_var = min_std * min_std
         self._clip = clip
         self.dtype = dtype
+        self.std_clip = std_clip
         self._build_params(shape, device, init_mean, init_std)
         return
 
@@ -46,6 +47,8 @@ class Normalizer(torch.nn.Module):
         self._count[:] = new_total
 
         self._std[:] = self._calc_std(self._mean, self._mean_sq)
+        if self.std_clip is not None:
+            self._std.data.clamp_(min=self.std_clip)
 
         self._new_count = 0
         self._new_sum[:] = 0

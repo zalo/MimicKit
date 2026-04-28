@@ -74,6 +74,7 @@ class ADDAgent(amp_agent.AMPAgent):
         obs_diff = disc_obs_demo - disc_obs
         norm_obs_diff = self._disc_obs_norm.normalize(obs_diff)
         disc_r = self._calc_disc_rewards(norm_obs_diff)
+        disc_reward_std, disc_reward_mean = torch.std_mean(disc_r)
 
         r = self._task_reward_weight * task_r + self._disc_reward_weight * disc_r
         self._exp_buffer.set_data_flat("reward", r)
@@ -81,7 +82,6 @@ class ADDAgent(amp_agent.AMPAgent):
         if (self._need_normalizer_update()):
             self._disc_obs_norm.record(obs_diff)
 
-        disc_reward_std, disc_reward_mean = torch.std_mean(disc_r)
         info = {
             "disc_reward_mean": disc_reward_mean,
             "disc_reward_std": disc_reward_std

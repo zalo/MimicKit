@@ -9,7 +9,7 @@ import util.torch_util as torch_util
 class AMPEnv(deepmimic_env.DeepMimicEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
         self._num_disc_obs_steps = env_config["num_disc_obs_steps"]
-
+        self._disc_dof_vel_obs = env_config.get("disc_dof_vel_obs", True)
         super().__init__(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device,
                          visualize=visualize, record_video=record_video)
         return
@@ -25,6 +25,9 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
             dtype=disc_obs_dtype,
         )
         return disc_obs_space
+
+    def get_num_disc_obs_steps(self):
+        return self._num_disc_obs_steps
 
     def fetch_disc_obs_demo(self, num_samples):
         motion_ids, motion_times0 = self._sample_motion_times(num_samples)
@@ -57,7 +60,8 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
                                   dof_vel=dof_vel,
                                   key_pos=key_pos,
                                   global_obs=self._global_obs,
-                                  root_height_obs=self._root_height_obs)
+                                  root_height_obs=self._root_height_obs,
+                                  dof_vel_obs=self._disc_dof_vel_obs)
         return disc_obs
 
     def _fetch_disc_demo_data(self, motion_ids, motion_times0):
@@ -232,7 +236,8 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
                                   dof_vel=dof_vel,
                                   key_pos=key_pos,
                                   global_obs=self._global_obs,
-                                  root_height_obs=self._root_height_obs)
+                                  root_height_obs=self._root_height_obs,
+                                  dof_vel_obs=self._disc_dof_vel_obs)
 
         if (env_ids is None):
             self._disc_obs_buf[:] = disc_obs
@@ -298,8 +303,8 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
 
     
 @torch.jit.script
-def compute_disc_vel_obs(ref_root_rot, root_vel, root_ang_vel, dof_vel, global_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, bool) -> Tensor
+def compute_disc_vel_obs(ref_root_rot, root_vel, root_ang_vel, dof_vel, global_obs, dof_vel_obs):
+    # type: (Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
 
     if (not global_obs):
         heading_inv_rot = torch_util.calc_heading_quat_inv(ref_root_rot)
@@ -319,14 +324,18 @@ def compute_disc_vel_obs(ref_root_rot, root_vel, root_ang_vel, dof_vel, global_o
         root_vel_obs = root_vel
         root_ang_vel_obs = root_ang_vel
 
-    obs = [root_vel_obs, root_ang_vel_obs, dof_vel]
+    obs = [root_vel_obs, root_ang_vel_obs]
+
+    if (dof_vel_obs):
+        obs = obs + [dof_vel]
+
     obs = torch.cat(obs, dim=-1)
 
     return obs
 
 @torch.jit.script
-def compute_disc_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
+def compute_disc_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs, dof_vel_obs):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, bool) -> Tensor
 
     pos_obs = deepmimic_env.compute_tar_obs(ref_root_pos=ref_root_pos, 
                                                ref_root_rot=ref_root_rot, 
@@ -341,7 +350,8 @@ def compute_disc_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, root_vel, r
                                   root_vel=root_vel, 
                                   root_ang_vel=root_ang_vel, 
                                   dof_vel=dof_vel,
-                                  global_obs=global_obs)
+                                  global_obs=global_obs,
+                                  dof_vel_obs=dof_vel_obs)
 
     disc_obs = torch.cat([pos_obs, vel_obs], dim=-1)
     disc_obs = torch.reshape(disc_obs, [disc_obs.shape[0], -1])

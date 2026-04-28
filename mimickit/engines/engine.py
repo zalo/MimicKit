@@ -1,6 +1,7 @@
 import abc
 import enum
 import time
+import numpy as np
 
 class ControlMode(enum.Enum):
     none = 0
@@ -75,6 +76,10 @@ class Engine:
     @abc.abstractmethod
     def get_num_envs(self):
         return 0
+    
+    @abc.abstractmethod
+    def get_gravity(self):
+        return np.array([0.0, 0.0, -9.81])
     
     @abc.abstractmethod
     def get_root_pos(self, obj_id):

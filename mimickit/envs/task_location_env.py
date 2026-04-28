@@ -2,15 +2,25 @@ import numpy as np
 import torch
 
 import engines.engine as engine
-import envs.amp_env as amp_env
+import envs.smp_env as smp_env
 import util.torch_util as torch_util
 
-class TaskLocationEnv(amp_env.AMPEnv):
+class TaskLocationEnv(smp_env.SMPEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
         self._tar_speed = env_config["tar_speed"]
         self._tar_change_time_min = env_config["tar_change_time_min"]
         self._tar_change_time_max = env_config["tar_change_time_max"]
+        self._tar_dist_min = env_config.get("tar_dist_min", 0.0)
         self._tar_dist_max = env_config["tar_dist_max"]
+        assert(self._tar_dist_max >= self._tar_dist_min)
+
+        self._dist_threshold = env_config.get("dist_threshold", 0.5)
+
+        self._pos_err_scale = env_config.get("pos_err_scale", 0.5)
+        self._vel_err_scale = env_config.get("vel_err_scale", 4.0)
+        self._pos_reward_w = env_config.get("pos_reward_w", 0.5)
+        self._vel_reward_w = env_config.get("vel_reward_w", 0.4)
+        self._face_reward_w = env_config.get("face_reward_w", 0.1)
 
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
@@ -115,7 +125,7 @@ class TaskLocationEnv(amp_env.AMPEnv):
 
         char_root_pos = root_pos[env_ids, 0:2]
 
-        rand_dist = self._tar_dist_max * torch.rand_like(char_root_pos[..., 0])
+        rand_dist = (self._tar_dist_max - self._tar_dist_min) * torch.rand_like(char_root_pos[..., 0]) + self._tar_dist_min
         rand_theta = 2 * np.pi * torch.rand_like(char_root_pos[..., 0])
         rand_pos = char_root_pos.clone()
         rand_pos[..., 0] += rand_dist * torch.cos(rand_theta)
@@ -152,7 +162,14 @@ class TaskLocationEnv(amp_env.AMPEnv):
                                                       root_rot=char_root_rot,
                                                       tar_pos=self._tar_pos, 
                                                       tar_speed=self._tar_speed,
-                                                      dt=self._engine.get_timestep())
+                                                      dt=self._engine.get_timestep(),
+                                                      dist_threshold=self._dist_threshold,
+                                                      pos_err_scale=self._pos_err_scale,
+                                                      vel_err_scale=self._vel_err_scale,
+                                                      pos_reward_w=self._pos_reward_w,
+                                                      vel_reward_w=self._vel_reward_w,
+                                                      face_reward_w=self._face_reward_w
+                                                      )
         return
 
     def _update_misc(self):
@@ -198,16 +215,8 @@ def compute_location_observations(root_pos, root_rot, tar_pos):
     return obs
 
 @torch.jit.script
-def compute_location_reward(root_pos, prev_root_pos, root_rot, tar_pos, tar_speed, dt):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, float) -> Tensor
-    dist_threshold = 0.5
-
-    pos_err_scale = 0.5
-    vel_err_scale = 4.0
-
-    pos_reward_w = 0.5
-    vel_reward_w = 0.4
-    face_reward_w = 0.1
+def compute_location_reward(root_pos, prev_root_pos, root_rot, tar_pos, tar_speed, dt, dist_threshold, pos_err_scale, vel_err_scale, pos_reward_w, vel_reward_w, face_reward_w):
+    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float, float, float, float, float, float) -> Tensor
     
     pos_diff = tar_pos - root_pos
     pos_err = pos_diff[..., 0] * pos_diff[..., 0] + pos_diff[..., 1] * pos_diff[..., 1]

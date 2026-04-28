@@ -120,11 +120,11 @@ class AMPAgent(ppo_agent.PPOAgent):
 
         norm_disc_obs = self._disc_obs_norm.normalize(disc_obs)
         disc_r = self._calc_disc_rewards(norm_disc_obs)
+        disc_reward_std, disc_reward_mean = torch.std_mean(disc_r)
 
         r = self._task_reward_weight * task_r + self._disc_reward_weight * disc_r
         self._exp_buffer.set_data_flat("reward", r)
         
-        disc_reward_std, disc_reward_mean = torch.std_mean(disc_r)
         info = {
             "disc_reward_mean": disc_reward_mean,
             "disc_reward_std": disc_reward_std

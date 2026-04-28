@@ -227,6 +227,23 @@ def quat_to_tan_norm(q):
     return norm_tan
 
 @torch.jit.script
+def tan_norm_to_matrix(tan_norm):
+    # type: (Tensor) -> Tensor
+    tan = tan_norm[..., 0:3]
+    norm = tan_norm[..., 3:6]
+    col2 = torch.cross(norm, tan, dim=-1)
+    mat3 = torch.cat([tan.unsqueeze(-2), col2.unsqueeze(-2), norm.unsqueeze(-2)], dim=-2)
+    mat3 = torch.transpose(mat3, -1, -2)
+    return mat3
+
+@torch.jit.script
+def tan_norm_to_quat(tan_norm):
+    # type: (torch.Tensor) -> torch.Tensor
+    mat = tan_norm_to_matrix(tan_norm)
+    quat = matrix_to_quat(mat)
+    return quat
+
+@torch.jit.script
 def exp_map_to_axis_angle(exp_map):
     # type: (Tensor) -> Tuple[Tensor, Tensor]
     min_theta = 1e-5

@@ -263,6 +263,12 @@ class IsaacGymEngine(engine.Engine):
     def get_num_envs(self):
         return self._num_envs
     
+    def get_gravity(self):
+        sim_params = self._gym.get_sim_params(self._sim)
+        gravity = sim_params.gravity
+        gravity = np.array([gravity.x, gravity.y, gravity.z])
+        return gravity
+    
     def get_objs_per_env(self):
         return self._objs_per_env
     

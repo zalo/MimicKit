@@ -101,6 +101,12 @@ class MotionLib():
     def get_motion_weights(self):
         return self._motion_weights
     
+    def get_motion_frame_size(self):
+        return 6 + self._kin_char_model.get_dof_size()
+    
+    def get_num_joints(self):
+        return self._kin_char_model.get_num_joints()
+
     def _extract_frame_data(self, frame):
         root_pos, root_rot, joint_dof = extract_pose_data(frame)
         root_pos = torch.tensor(root_pos, dtype=torch.float32, device=self._device)
@@ -248,7 +254,7 @@ class MotionLib():
             loop_mode = curr_motion.loop_mode.value
             frames = curr_motion.frames
             num_frames = frames.shape[0]
-
+            
             root_pos, root_rot, joint_rot = self._extract_frame_data(frames)
 
             self._motion_files.append(curr_file)
