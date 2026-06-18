@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MimicKit - ASE Humanoid Locomotion</title>
+<title>MimicKit - ASE Humanoid Sword &amp; Shield</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
@@ -38,7 +38,7 @@ canvas { display: block; }
 </div>
 
 <div id="hud">
-    <div class="title">ASE Humanoid - Locomotion</div>
+    <div class="title">ASE Humanoid - Sword &amp; Shield</div>
     <div id="fpsDisplay">FPS: --</div>
     <div id="physInfo">PhysX WASM + ONNX Runtime</div>
 </div>
@@ -546,7 +546,7 @@ async function loadOnnxModel() {
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
 
     // Fetch as ArrayBuffer so we can both create the session AND scan for metadata
-    const resp = await fetch('./ase_humanoid_locomotion_actor.onnx');
+    const resp = await fetch('./ase_humanoid_sword_shield_actor.onnx');
     onnxBuffer = await resp.arrayBuffer();
     onnxSession = await ort.InferenceSession.create(onnxBuffer, { executionProviders: ['wasm'] });
     console.log('ONNX model loaded (' + (onnxBuffer.byteLength / 1024 / 1024).toFixed(1) + ' MB)');
