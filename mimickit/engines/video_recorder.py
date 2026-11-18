@@ -29,5 +29,5 @@ class VideoRecorder:
         return
     
     @abc.abstractmethod
-    def _record_Frame(self):
+    def _record_frame(self):
         return

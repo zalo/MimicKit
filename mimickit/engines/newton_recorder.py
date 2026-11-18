@@ -12,6 +12,7 @@ from util.logger import Logger
 if TYPE_CHECKING:
     import engines.newton_engine as newton_engine
 
+
 class NewtonVideoRecorder(video_recorder.VideoRecorder):
     def __init__(self,
                  engine: newton_engine.NewtonEngine,
@@ -39,7 +40,9 @@ class NewtonVideoRecorder(video_recorder.VideoRecorder):
             height=self._resolution[1],
             headless=True
         )
-        self._engine.init_viewer(self._viewer)
+        num_visible_envs = min(16, self._engine.get_num_envs())
+        self._engine.init_viewer(self._viewer, visible_env_ids=range(num_visible_envs))
+
         Logger.print(f"[NewtonVideoRecorder] Created dedicated recording viewer at {self._resolution[0]}x{self._resolution[1]}")
         return
     

@@ -34,4 +34,5 @@ reward_root_vel_scale: 1.0
 reward_key_pos_scale: 10.0
 
 engine:
+  base_links: ["base_link"]
   ground_contact_height: 0.2 # this is needed for IsaacGym

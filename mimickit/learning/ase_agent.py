@@ -173,11 +173,11 @@ class ASEAgent(amp_agent.AMPAgent):
 
         succ_val = self._compute_succ_val()
         succ_mask = (done == base_env.DoneFlags.SUCC.value)
-        next_vals[succ_mask] = succ_val
+        next_vals = torch.where(succ_mask, succ_val, next_vals)
 
         fail_val = self._compute_fail_val()
         fail_mask = (done == base_env.DoneFlags.FAIL.value)
-        next_vals[fail_mask] = fail_val
+        next_vals = torch.where(fail_mask, fail_val, next_vals)
 
         new_vals = rl_util.compute_td_lambda_return(r, next_vals, done, self._discount, self._td_lambda)
 
@@ -330,6 +330,7 @@ class ASEAgent(amp_agent.AMPAgent):
         
         return info
     
+    @torch.compile
     def _compute_critic_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
         tar_val = batch["tar_val"]
@@ -345,6 +346,7 @@ class ASEAgent(amp_agent.AMPAgent):
         }
         return info
 
+    @torch.compile
     def _compute_enc_loss(self, batch):
         disc_obs = batch["disc_obs"]
         tar_latents = batch["latents"]

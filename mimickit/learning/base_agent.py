@@ -357,7 +357,7 @@ class BaseAgent(torch.nn.Module):
         self._logger.log("Wall_Time", wall_time_hrs, collection="1_Info")
         self._logger.log("Samples", self._sample_count, collection="1_Info")
         self._logger.log("Samples_Per_Second", self._sample_count / wall_time_secs, collection="1_Info", quiet=True)
-
+        
         test_return = test_info["mean_return"]
         test_ep_len = test_info["mean_ep_len"]
         test_eps = test_info["num_eps"]

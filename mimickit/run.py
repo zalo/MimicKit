@@ -94,6 +94,13 @@ def set_rand_seed(args):
     util.set_rand_seed(rand_seed)
     return
 
+def disable_torch_compile():
+    if (hasattr(torch.compiler, "set_stance")):
+        torch.compiler.set_stance("force_eager")
+    else:
+        torch._dynamo.config.disable = True
+    return
+
 def run(rank, num_procs, device, master_port, args):
     mode = args.parse_string("mode", "train")
     num_envs = args.parse_int("num_envs", 1)
@@ -104,6 +111,10 @@ def run(rank, num_procs, device, master_port, args):
     out_dir = args.parse_string("out_dir", "output/")
     save_int_models = args.parse_bool("save_int_models", False)
     max_samples = args.parse_int("max_samples", np.iinfo(np.int64).max)
+
+    if (visualize):
+        # disable torch compile when visualizations are on for faster startup
+        disable_torch_compile()
 
     mp_util.init(rank, num_procs, device, master_port)
 

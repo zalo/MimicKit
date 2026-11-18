@@ -35,7 +35,7 @@ To use Isaac Gym, specify the argument `--engine_config data/engines/isaac_gym_e
 <details>
 <summary>Isaac Lab</summary>
 
-Install [Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). This framework has been tested with `2ed331acfcbb1b96c47b190564476511836c3754`.
+Install [Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). This framework has been tested with `v3.0.0-EA`.
 
 To use Isaac Lab, specify the argument `--engine_config data/engines/isaac_lab_engine.yaml` when running the code.
 </details>
@@ -43,7 +43,7 @@ To use Isaac Lab, specify the argument `--engine_config data/engines/isaac_lab_e
 <details>
 <summary>Newton</summary>
 
-Install [Newton](https://newton-physics.github.io/newton/guide/installation.html). This framework has been tested with `v1.0.0`.
+Install [Newton](https://newton-physics.github.io/newton/guide/installation.html). This framework has been tested with `v1.6.1`.
 
 To use Newton, specify the argument `--engine_config data/engines/newton_engine.yaml` when running the code.
 </details>

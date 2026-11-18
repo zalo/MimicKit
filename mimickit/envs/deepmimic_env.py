@@ -19,7 +19,7 @@ class DeepMimicEnv(char_env.CharEnv):
         self._enable_phase_obs = env_config.get("enable_phase_obs", True)
         self._enable_tar_obs = env_config.get("enable_tar_obs", False)
         self._tar_obs_steps = env_config.get("tar_obs_steps", [1])
-        self._tar_obs_steps = torch.tensor(self._tar_obs_steps, device=device, dtype=torch.int)
+        self._tar_obs_steps = torch.tensor(self._tar_obs_steps, device=device, dtype=torch.long)
         self._rand_reset = env_config.get("rand_reset", True)
         
         self._ref_char_offset = torch.tensor(env_config["ref_char_offset"], device=device, dtype=torch.float)
@@ -141,7 +141,7 @@ class DeepMimicEnv(char_env.CharEnv):
     def _get_ref_char_color(self):
         engine_name = self._engine.get_name()
         if (engine_name == "isaac_lab"):
-            col = np.array([0.25, 0.4, 0.1])
+            col = np.array([0.07, 0.22, 0.01])
         elif (engine_name == "newton"):
             col = np.array([0.3, 0.5, 0.1])
         else:
@@ -172,6 +172,7 @@ class DeepMimicEnv(char_env.CharEnv):
         self._engine.set_body_ang_vel(env_ids, ref_char_id, 0.0)
         return
 
+    @torch.compile
     def _reset_ref_motion(self, env_ids):
         n = len(env_ids)
         motion_ids, motion_times = self._sample_motion_times(n)
@@ -187,10 +188,9 @@ class DeepMimicEnv(char_env.CharEnv):
         self._ref_joint_rot[env_ids] = joint_rot
         self._ref_dof_vel[env_ids] = dof_vel
         
-        ref_body_pos, ref_body_rot = self._kin_char_model.forward_kinematics(self._ref_root_pos, self._ref_root_rot,
-                                                                             self._ref_joint_rot)
-        self._ref_body_pos[:] = ref_body_pos
-        self._ref_body_rot[:] = ref_body_rot
+        ref_body_pos, ref_body_rot = self._kin_char_model.forward_kinematics(root_pos, root_rot, joint_rot)
+        self._ref_body_pos[env_ids] = ref_body_pos
+        self._ref_body_rot[env_ids] = ref_body_rot
 
         dof_pos = self._motion_lib.joint_rot_to_dof(joint_rot)
         self._ref_dof_pos[env_ids] = dof_pos
@@ -327,28 +327,21 @@ class DeepMimicEnv(char_env.CharEnv):
                                           color=color)
         return char_id
 
+    @torch.compile
     def _compute_obs(self, env_ids=None):
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times(env_ids)
         
         char_id = self._get_char_id()
-        root_pos = self._engine.get_root_pos(char_id)
-        root_rot = self._engine.get_root_rot(char_id)
-        root_vel = self._engine.get_root_vel(char_id)
-        root_ang_vel = self._engine.get_root_ang_vel(char_id)
-        dof_pos = self._engine.get_dof_pos(char_id)
-        dof_vel = self._engine.get_dof_vel(char_id)
-        body_pos = self._engine.get_body_pos(char_id)
+        root_pos = self._engine.get_root_pos_obs(char_id, env_ids)
+        root_rot = self._engine.get_root_rot_obs(char_id, env_ids)
+        root_vel = self._engine.get_root_vel_obs(char_id, env_ids)
+        root_ang_vel = self._engine.get_root_ang_vel_obs(char_id, env_ids)
+        dof_pos = self._engine.get_dof_pos_obs(char_id, env_ids)
+        dof_vel = self._engine.get_dof_vel_obs(char_id, env_ids)
+        body_pos = self._engine.get_body_pos_obs(char_id, env_ids)
 
         if (env_ids is not None):
-            root_pos = root_pos[env_ids]
-            root_rot = root_rot[env_ids]
-            root_vel = root_vel[env_ids]
-            root_ang_vel = root_ang_vel[env_ids]
-            dof_pos = dof_pos[env_ids]
-            dof_vel = dof_vel[env_ids]
-            body_pos = body_pos[env_ids]
-
             motion_ids = motion_ids[env_ids]
             
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
@@ -581,9 +574,7 @@ class DeepMimicEnv(char_env.CharEnv):
         return root_pos, root_rot, joint_rot
 
 
-@torch.jit.script
 def compute_phase_obs(phase, num_phase_encoding):
-    # type: (Tensor, int) -> Tensor
     phase_obs = phase.unsqueeze(-1)
 
     # positional embedding of phase
@@ -599,9 +590,7 @@ def compute_phase_obs(phase, num_phase_encoding):
 
     return phase_obs
 
-@torch.jit.script
 def convert_to_local(root_rot, root_vel, root_ang_vel, key_pos):
-    # type: (Tensor, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]
 
     heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
 
@@ -622,10 +611,8 @@ def convert_to_local(root_rot, root_vel, root_ang_vel, key_pos):
 
     return local_root_rot, local_root_vel, local_root_ang_vel, local_key_pos
 
-@torch.jit.script
 def compute_tar_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, joint_rot, key_pos,
                     global_obs, root_height_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
     ref_root_pos = ref_root_pos.unsqueeze(-2)
     root_pos_obs = root_pos - ref_root_pos
     
@@ -676,11 +663,9 @@ def compute_tar_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, joint_rot, k
 
     return obs
 
-@torch.jit.script
 def compute_deepmimic_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs, 
                           phase, num_phase_encoding, enable_phase_obs, 
                           enable_tar_obs, tar_root_pos, tar_root_rot, tar_joint_rot, tar_key_pos):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, Tensor, int, bool, bool, Tensor, Tensor, Tensor, Tensor) -> Tensor
     char_obs = char_env.compute_char_obs(root_pos=root_pos,
                                             root_rot=root_rot,
                                             root_vel=root_vel,
@@ -720,29 +705,27 @@ def compute_deepmimic_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot,
     
     return obs
 
-@torch.jit.script
 def compute_done(done_buf, time, ep_len, root_rot, body_pos, tar_root_rot, tar_body_pos, 
                  ground_contact_force, contact_body_ids,
                  pose_termination, pose_termination_dist, 
                  global_obs, enable_early_termination,
                  motion_times, motion_len, motion_len_term,
                  track_root):
-    # type: (Tensor, Tensor, float, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, float, bool, bool, Tensor, Tensor, Tensor, bool) -> Tensor
     done = torch.full_like(done_buf, base_env.DoneFlags.NULL.value)
     
     timeout = time >= ep_len
-    done[timeout] = base_env.DoneFlags.TIME.value
+    done.masked_fill_(timeout, base_env.DoneFlags.TIME.value)
     
     motion_end = motion_times >= motion_len
     motion_end = torch.logical_and(motion_end, motion_len_term)
-    done[motion_end] = base_env.DoneFlags.SUCC.value
+    done.masked_fill_(motion_end, base_env.DoneFlags.SUCC.value)
 
     if (enable_early_termination):
         failed = torch.zeros(done.shape, device=done.device, dtype=torch.bool)
 
         if (contact_body_ids.shape[0] > 0):
             masked_contact_buf = ground_contact_force.detach().clone()
-            masked_contact_buf[:, contact_body_ids, :] = 0
+            masked_contact_buf.index_fill_(1, contact_body_ids, 0)
             fall_contact = torch.any(torch.abs(masked_contact_buf) > 0.1, dim=-1)
 
             has_fallen = torch.any(fall_contact, dim=-1)
@@ -779,18 +762,16 @@ def compute_done(done_buf, time, ep_len, root_rot, body_pos, tar_root_rot, tar_b
         # only fail after first timestep
         not_first_step = (time > 0.0)
         failed = torch.logical_and(failed, not_first_step)
-        done[failed] = base_env.DoneFlags.FAIL.value
+        done.masked_fill_(failed, base_env.DoneFlags.FAIL.value)
     
     return done
 
-@torch.jit.script
 def compute_reward(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos,
                    tar_root_pos, tar_root_rot, tar_root_vel, tar_root_ang_vel,
                    tar_joint_rot, tar_dof_vel, tar_key_pos,
                    joint_rot_err_w, dof_err_w, track_root_h, track_root,
                    pose_w, vel_w, root_pose_w, root_vel_w, key_pos_w,
                    pose_scale, vel_scale, root_pose_scale, root_vel_scale, key_pos_scale):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, float, float, float, float, float, float, float, float, float, float) -> Tensor
     pose_diff = torch_util.quat_diff_angle(joint_rot, tar_joint_rot)
     pose_err = torch.sum(joint_rot_err_w * pose_diff * pose_diff, dim=-1)
 
@@ -800,10 +781,10 @@ def compute_reward(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_ve
     root_pos_diff = tar_root_pos - root_pos
 
     if (not track_root):
-        root_pos_diff[..., 0:2] = 0
+        root_pos_diff[..., 0:2].zero_()
 
     if (not track_root_h):
-        root_pos_diff[..., 2] = 0
+        root_pos_diff[..., 2].zero_()
 
     root_pos_err = torch.sum(root_pos_diff * root_pos_diff, dim=-1)
     
@@ -845,13 +826,11 @@ def compute_reward(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_ve
 
     return r
 
-@torch.jit.script
 def compute_tracking_error(root_pos, root_rot, body_rot, body_pos,
                             tar_root_pos, tar_root_rot,
                             tar_body_rot, tar_body_pos,
                             root_vel, root_ang_vel, dof_vel,
                             tar_root_vel, tar_root_ang_vel, tar_dof_vel):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) -> Tensor
     body_pos = body_pos - root_pos.unsqueeze(-2)
     tar_body_pos = tar_body_pos - tar_root_pos.unsqueeze(-2)
 

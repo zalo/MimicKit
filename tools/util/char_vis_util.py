@@ -51,7 +51,7 @@ def output_body_pos_anim(body_pos, parents, save_path, speedup=1, fps=30):
     ani_obj.save(save_path + '.gif', writer=writergif)
     plt.close(fig)
     return
-   
+
 def plot_ani(fig, ax, body_pos, parents, fps=60, colors=None):
     links = []
     for i in range(len(parents)):

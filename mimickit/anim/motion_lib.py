@@ -28,7 +28,7 @@ class MotionLib():
         return torch.sum(self._motion_lengths).item()
 
     def sample_motions(self, n):
-        motion_ids = torch.multinomial(self._motion_weights, num_samples=n, replacement=True)
+        motion_ids = torch_util.sample_categorical(self._motion_weights, n)
         return motion_ids
 
     def sample_time(self, motion_ids, truncate_time=None):
@@ -152,6 +152,9 @@ class MotionLib():
         
         self._process_data()
 
+        # release cached gpu memory from temporary tensors used while loading data
+        torch.cuda.empty_cache()
+
         num_motions = self.get_num_motions()
         total_len = self.get_total_length()
         Logger.print("Loaded motion file: {}".format(motion_file))
@@ -270,7 +273,7 @@ class MotionLib():
         self._motion_weights = torch.tensor(self._motion_weights, dtype=torch.float32, device=self._device)
         self._motion_fps = torch.tensor(self._motion_fps, dtype=torch.float32, device=self._device)
         self._motion_num_frames = torch.tensor(self._motion_num_frames, dtype=torch.long, device=self._device)
-        self._motion_loop_modes = torch.tensor(self._motion_loop_modes, dtype=torch.int, device=self._device)
+        self._motion_loop_modes = torch.tensor(self._motion_loop_modes, dtype=torch.long, device=self._device)
         
         self._frame_root_pos = torch.cat(self._frame_root_pos, dim=0)
         self._frame_root_rot = torch.cat(self._frame_root_rot, dim=0)

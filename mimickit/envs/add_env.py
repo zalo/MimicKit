@@ -31,6 +31,7 @@ class ADDEnv(amp_env.AMPEnv):
         deepmimic_env.DeepMimicEnv._update_ref_motion(self)
         return
     
+    @torch.compile
     def _update_disc_obs(self, env_ids=None):
         root_pos = self._disc_hist_root_pos.get_all()
         root_rot = self._disc_hist_root_rot.get_all()
@@ -98,9 +99,7 @@ class ADDEnv(amp_env.AMPEnv):
         deepmimic_env.DeepMimicEnv._update_done(self)
         return
 
-@torch.jit.script
 def compute_pos_obs(root_pos, root_rot, joint_rot, body_pos, global_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, bool) -> Tensor
 
     root_pos_obs = root_pos.detach().clone()
     body_pos = body_pos - root_pos.unsqueeze(-2)
@@ -134,9 +133,7 @@ def compute_pos_obs(root_pos, root_rot, joint_rot, body_pos, global_obs):
 
     return obs
 
-@torch.jit.script
 def compute_disc_vel_obs(root_rot, root_vel, root_ang_vel, dof_vel, global_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, bool) -> Tensor
 
     if not global_obs:
         heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
@@ -151,9 +148,7 @@ def compute_disc_vel_obs(root_rot, root_vel, root_ang_vel, dof_vel, global_obs):
 
     return obs
 
-@torch.jit.script
 def compute_disc_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, body_pos, global_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool) -> Tensor
 
     pos_obs = compute_pos_obs(root_pos=root_pos, 
                             root_rot=root_rot, 

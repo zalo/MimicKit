@@ -16,6 +16,6 @@ def build_engine(config, num_envs, device, visualize, record_video=False):
         import engines.newton_engine as newton_engine
         engine = newton_engine.NewtonEngine(config, num_envs, device, visualize, record_video=record_video)
     else:
-        assert False, print("Unsupported engine: {:s}".format(eng_name))
+        assert False, "Unsupported engine: {:s}".format(eng_name)
 
     return engine

@@ -116,11 +116,11 @@ class AWRAgent(base_agent.BaseAgent):
 
         succ_val = self._compute_succ_val()
         succ_mask = (done == base_env.DoneFlags.SUCC.value)
-        next_vals[succ_mask] = succ_val
+        next_vals = torch.where(succ_mask, succ_val, next_vals)
 
         fail_val = self._compute_fail_val()
         fail_mask = (done == base_env.DoneFlags.FAIL.value)
-        next_vals[fail_mask] = fail_val
+        next_vals = torch.where(fail_mask, fail_val, next_vals)
 
         new_vals = rl_util.compute_td_lambda_return(r, next_vals, done, self._discount, self._td_lambda)
 
@@ -220,6 +220,7 @@ class AWRAgent(base_agent.BaseAgent):
         torch_util.scale_torch_dict(1.0 / num_steps, info)
         return info
     
+    @torch.compile
     def _compute_critic_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
         tar_val = batch["tar_val"]
@@ -234,23 +235,25 @@ class AWRAgent(base_agent.BaseAgent):
         }
         return info
 
+    @torch.compile
     def _compute_actor_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
         norm_a = self._a_norm.normalize(batch["action"])
         a_weight = batch["a_weight"]
         rand_action_mask = batch["rand_action_mask"]
 
-        # loss should only be computed using samples with random actions
+        # loss should only be computed using samples with random actions,
+        # masked means are used instead of boolean indexing to avoid a GPU-CPU sync
         rand_action_mask = (rand_action_mask == 1.0)
-        norm_obs = norm_obs[rand_action_mask]
-        norm_a = norm_a[rand_action_mask]
-        a_weight = a_weight[rand_action_mask]
+        num_rand_actions = torch.sum(rand_action_mask)
+        def masked_mean(x):
+            return torch.sum(torch.where(rand_action_mask, x, 0.0)) / num_rand_actions
 
         a_dist = self._model.eval_actor(norm_obs)
         a_logp = a_dist.log_prob(norm_a)
         
         actor_loss = a_weight * a_logp
-        actor_loss = -torch.mean(actor_loss)
+        actor_loss = -masked_mean(actor_loss)
         
         info = {
             "actor_loss": actor_loss
@@ -259,19 +262,19 @@ class AWRAgent(base_agent.BaseAgent):
         if (self._action_bound_weight != 0):
             action_bound_loss = self._compute_action_bound_loss(a_dist)
             if (action_bound_loss is not None):
-                action_bound_loss = torch.mean(action_bound_loss)
+                action_bound_loss = masked_mean(action_bound_loss)
                 actor_loss += self._action_bound_weight * action_bound_loss
                 info["action_bound_loss"] = action_bound_loss.detach()
 
         if (self._action_entropy_weight != 0):
             action_entropy = a_dist.entropy()
-            action_entropy = torch.mean(action_entropy)
+            action_entropy = masked_mean(action_entropy)
             actor_loss += -self._action_entropy_weight * action_entropy
             info["action_entropy"] = action_entropy.detach()
         
         if (self._action_reg_weight != 0):
             action_reg_loss = a_dist.param_reg()
-            action_reg_loss = torch.mean(action_reg_loss)
+            action_reg_loss = masked_mean(action_reg_loss)
             actor_loss += self._action_reg_weight * action_reg_loss
             info["action_reg_loss"] = action_reg_loss.detach()
         

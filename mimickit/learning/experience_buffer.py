@@ -11,6 +11,8 @@ class ExperienceBuffer():
 
         self._buffers = dict()
         self._flat_buffers = dict()
+        self._step_buffers = dict()
+        
         self._sample_buf = torch.randperm(self.get_capacity(), device=self._device, dtype=torch.long)
         self._sample_buf_head = 0
         self._reset_sample_buf()
@@ -25,6 +27,7 @@ class ExperienceBuffer():
 
         flat_shape = [buffer_shape[0] * buffer_shape[1]] + list(data_shape)
         self._flat_buffers[name] = buffer.view(flat_shape)
+        self._step_buffers[name] = buffer.unbind(0)
         return
 
     def reset(self):
@@ -58,12 +61,13 @@ class ExperienceBuffer():
     def record(self, name, data):
         assert(data.shape[0] == self._batch_size)
 
-        sample_count = self.get_sample_count()
-        if (sample_count == 0 and name not in self._buffers):
+        if (name not in self._buffers):
+            # new buffers can only be added before any samples have been recorded
+            assert(self.get_sample_count() == 0)
             self.add_buffer(name, data.shape[1:], data.dtype)
 
-        data_buf = self._buffers[name]
-        data_buf[self._buffer_head] = data
+        step_buf = self._step_buffers[name][self._buffer_head]
+        step_buf.copy_(data)
         return
 
     def get_data(self, name):
@@ -145,7 +149,7 @@ class ExperienceBuffer():
             self._sample_buf_head += n
             
         else:
-            rand_idx0 = self._sample_buf[self._sample_buf_head:]
+            rand_idx0 = self._sample_buf[self._sample_buf_head:].clone()
             remainder = n - (buffer_len - self._sample_buf_head)
 
             self._reset_sample_buf()
@@ -155,5 +159,7 @@ class ExperienceBuffer():
             self._sample_buf_head = remainder
 
         sample_count = self.get_sample_count()
-        rand_idx = torch.remainder(rand_idx, sample_count)
+        if (sample_count < buffer_len):
+            rand_idx = torch.remainder(rand_idx, sample_count)
+        
         return rand_idx
