@@ -16,7 +16,6 @@ model_ema_update_after: 5_000
 
 normalizer_std_clip: 0.2
 
-device: "cuda"
 batch_size: 512
 lr: 0.0002
 num_iterations: 200_000

@@ -64,6 +64,7 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
                                   dof_vel_obs=self._disc_dof_vel_obs)
         return disc_obs
 
+    @torch.compile
     def _fetch_disc_demo_data(self, motion_ids, motion_times0):
         num_samples = motion_ids.shape[0]
 
@@ -195,6 +196,7 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
             self._update_disc_obs(env_ids)
         return
 
+    @torch.compile
     def _update_disc_obs(self, env_ids=None):
         root_pos = self._disc_hist_root_pos.get_all()
         root_rot = self._disc_hist_root_rot.get_all()
@@ -302,9 +304,7 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
         return
 
     
-@torch.jit.script
 def compute_disc_vel_obs(ref_root_rot, root_vel, root_ang_vel, dof_vel, global_obs, dof_vel_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
 
     if (not global_obs):
         heading_inv_rot = torch_util.calc_heading_quat_inv(ref_root_rot)
@@ -333,9 +333,7 @@ def compute_disc_vel_obs(ref_root_rot, root_vel, root_ang_vel, dof_vel, global_o
 
     return obs
 
-@torch.jit.script
 def compute_disc_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs, dof_vel_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, bool) -> Tensor
 
     pos_obs = deepmimic_env.compute_tar_obs(ref_root_pos=ref_root_pos, 
                                                ref_root_rot=ref_root_rot, 

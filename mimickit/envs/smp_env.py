@@ -50,7 +50,7 @@ class SMPEnv(amp_env.AMPEnv):
         n = len(env_ids)
         motion_ids = self._motion_lib.sample_motions(n)
         self._motion_ids[env_ids] = motion_ids
-        self._motion_time_offsets[env_ids] = 0.0
+        self._motion_time_offsets.index_fill_(0, env_ids, 0.0)
 
         gsi_states = self._gsi_buffer.sample(n)
         

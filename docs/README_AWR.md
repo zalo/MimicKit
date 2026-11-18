@@ -11,7 +11,7 @@ To train an AWR model, use the following command:
 ```
 python mimickit/run.py --mode train --num_envs 4096 --engine_config data/engines/isaac_gym_engine.yaml --env_config data/envs/deepmimic_humanoid_env.yaml --agent_config data/agents/deepmimic_humanoid_awr_agent.yaml --visualize false --out_dir output/
 ```
-To test a DeepMimic model, run the following command:
+To test an AWR model, run the following command:
 ```
 python mimickit/run.py --mode test --num_envs 4 --engine_config data/engines/isaac_gym_engine.yaml --env_config data/envs/deepmimic_humanoid_env.yaml --agent_config data/agents/deepmimic_humanoid_awr_agent.yaml --visualize true --model_file data/models/deepmimic_humanoid_awr_spinkick_model.pt
 ```

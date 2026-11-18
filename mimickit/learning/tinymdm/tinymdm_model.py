@@ -12,7 +12,7 @@ from learning.tinymdm.cfg_model import ClassifierFreeSampleModel
 from learning.normalizer import Normalizer
 
 class TinyMDMModel(KinematicBaseModel):
-    def __init__(self, config):
+    def __init__(self, config, device):
         super().__init__(config)
 
         with open(config["env_config"], "r") as stream:
@@ -20,9 +20,9 @@ class TinyMDMModel(KinematicBaseModel):
         
         self.num_disc_obs_steps = env_config["num_disc_obs_steps"]
         self._obs_dtype = torch.float32
+        self._device = device
 
         self.T = config["T"]
-        self._device = config["device"]
         self.input_dim = config["input_dim"]
         self.input_channel = int(self.input_dim / self.num_disc_obs_steps)
         self.num_layers = config["num_layers"]

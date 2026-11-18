@@ -32,3 +32,6 @@ motion_file: "data/datasets/dataset_humanoid_locomotion.yaml"
 reward_steering_tar_w: 0.7
 reward_steering_face_w: 0.3
 reward_steering_vel_scale: 0.5
+
+engine:
+    base_links: ["pelvis", "torso", "right_clavicle", "left_clavicle"]

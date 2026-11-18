@@ -30,3 +30,6 @@ proj_trigger_time_min: 1.0
 proj_trigger_time_max: 4.0
 
 motion_file: "data/datasets/dataset_humanoid_locomotion.yaml"
+
+engine:
+    base_links: ["pelvis", "torso", "right_clavicle", "left_clavicle"]

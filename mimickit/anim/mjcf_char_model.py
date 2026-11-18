@@ -285,7 +285,7 @@ class MJCFCharModel(kin_char_model.KinCharModel):
             elif (joint_type == kin_char_model.JointType.FIXED):
                 joint_xml = ""
             else:
-                assert(False), "Unsupported joint type: {:s}".format(joint.joint_type)
+                assert(False), "Unsupported joint type: {:s}".format(joint_type)
 
         return joint_xml
 
@@ -332,8 +332,7 @@ class MJCFCharModel(kin_char_model.KinCharModel):
 
         num_joints = self.get_num_joints()
         for j in range(1, num_joints):
-            joint = self.get_joint(j)
-            joint_type = joint.joint_type
+            joint_type = self.get_joint_type(j)
             body_name = self._body_names[j]
 
             if (joint_type == kin_char_model.JointType.HINGE):
@@ -345,7 +344,7 @@ class MJCFCharModel(kin_char_model.KinCharModel):
             elif (joint_type == kin_char_model.JointType.FIXED):
                 actuator_xml = ""
             else:
-                assert(False), "Unsupported joint type: {:s}".format(joint.joint_type)
+                assert(False), "Unsupported joint type: {:s}".format(joint_type)
 
             actuators_xml += actuator_xml
 

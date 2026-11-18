@@ -5,35 +5,42 @@ import carb
 import numpy as np
 import os
 import torch
-import time
 
 import engines.engine as engine
 import engines.isaac_lab_recorder as isaac_lab_recorder
 from util.logger import Logger
 import util.torch_util as torch_util
 
-ROT_WXYZ_TO_XYZW = [1, 2, 3, 0]
-ROT_XYZW_TO_WXYZ = [3, 0, 1, 2]
-
 ENV_PATH_TEMPLATE = "/World/envs/env_{}"
 OBJ_PATH_TEMPLATE = "/World/envs/env_{}/obj_{}"
 GROUND_PATH = "/World/ground"
 LIGHT_PATH = "/World/Light"
+COLLISION_ROOT_PATH = "/World/collisions"
+CAMERA_PATH = "/OmniverseKit_Persp"
+ACTUATOR_GROUP = "actuators"
+
+BACKGROUND_COLOR = [0.85, 0.87, 0.92]
+GROUND_TEXTURE_FILE = "data/assets/ground_texture.png"
+GROUND_TILE_SIZE = 1.0
+DEFAULT_GROUND_TEXTURE_SIZE = 2.0
 
 def str_to_key_code(key_str):
     key_name = key_str.upper()
 
-    if (key_str == "ESC"):
+    if (key_name == "ESC"):
         key_name = "ESCAPE"
-    elif (key_str == "RETURN"):
+    elif (key_name == "RETURN"):
         key_name = "ENTER"
-    elif (key_str == "DELETE"):
+    elif (key_name == "DELETE"):
         key_name = "DEL"
-    elif (len(key_str) == 1 and key_str.isdigit()):
-        key_name = "KEY_" + key_str
+    elif (len(key_name) == 1 and key_name.isdigit()):
+        key_name = "KEY_" + key_name
     
     key_code = getattr(carb.input.KeyboardInput, key_name)
     return key_code
+
+def is_scalar(data):
+    return np.isscalar(data) or (torch.is_tensor(data) and data.dim() == 0)
 
 class ObjCfg:
     def __init__(self, obj_type, asset_file, is_visual, enable_self_collisions, 
@@ -80,7 +87,6 @@ class IsaacLabEngine(engine.Engine):
 
         self._env_spacing = config["env_spacing"]
         self._obj_cfgs = []
-        self._obj_control_modes = []
         
         if ("control_mode" in config):
             self._control_mode = engine.ControlMode[config["control_mode"]]
@@ -93,6 +99,7 @@ class IsaacLabEngine(engine.Engine):
         if (visualize or record_video):
             self._build_lights()
             self._build_camera()
+            self._build_ground_mesh()
 
         if (visualize):
             self._build_draw_interface()
@@ -115,15 +122,15 @@ class IsaacLabEngine(engine.Engine):
         return env_id
     
     def initialize_sim(self):
-        from isaacsim.core.cloner import Cloner
-
         self._validate_envs()
-        self._cloner = Cloner(self._stage)
 
         self._build_envs()
         self._build_objs()
         self._build_ground_contact_sensors()
         self._filter_env_collisions()
+
+        if (self.enabled_record_video()):
+            self._hide_unrecorded_envs()
 
         Logger.print("Initializing simulation...")
         self._sim.reset()
@@ -131,10 +138,15 @@ class IsaacLabEngine(engine.Engine):
         self._build_body_order_tensors()
         self._build_sensor_order_tensors()
         self._build_sim_tensors()
+
+        self._gravity = np.array(self._sim.cfg.gravity)
+        
+        super().initialize_sim()
         return
     
     def step(self):
         self._update_reset_objs()
+        self._apply_cmd()
 
         if (self.enabled_record_video() and self._recording):
             self._video_recorder.capture_frame()
@@ -151,9 +163,9 @@ class IsaacLabEngine(engine.Engine):
                    fix_root=False, start_pos=None, start_rot=None, 
                    color=None, disable_motors=False):
         if (start_rot is None):
-            start_rot = np.array([1.0, 0.0, 0.0, 0.0])
+            start_rot = np.array([0.0, 0.0, 0.0, 1.0])
         else:
-            start_rot = start_rot[ROT_XYZW_TO_WXYZ]
+            start_rot = start_rot.copy()
 
         if (start_pos is None):
             start_pos = np.array([0.0, 0.0, 0.0])
@@ -178,33 +190,43 @@ class IsaacLabEngine(engine.Engine):
         
         return obj_id
     
-    def set_cmd(self, obj_id, cmd):
-        obj = self._objs[obj_id]
-        dof_order_common2sim = self._dof_order_common2sim[obj_id]
-        sim_cmd = cmd[:, dof_order_common2sim]
+    def _apply_cmd(self):
+        for obj_id in range(self.get_objs_per_env()):
+            if (self._has_dof(obj_id)):
+                cmd = self._get_obj_dof_cmd(obj_id)
+                dof_order_common2sim = self._dof_order_common2sim[obj_id]
+                sim_cmd = cmd[:, dof_order_common2sim]
+                self._set_sim_cmd(obj_id, sim_cmd)
+        return
+    
+    def _set_sim_cmd(self, obj_id, sim_cmd):
+        # sim_cmd is in the simulator's dof order
+        target_command = self._objs[obj_id].actuators.target_command
 
         if (self._control_mode == engine.ControlMode.none):
             pass
         elif (self._control_mode == engine.ControlMode.pos):
-            obj.set_joint_position_target(sim_cmd)
+            target_command.set_position_index(value=sim_cmd)
         elif (self._control_mode == engine.ControlMode.vel):
-            obj.set_joint_velocity_target(sim_cmd)
+            target_command.set_velocity_index(value=sim_cmd)
         elif (self._control_mode == engine.ControlMode.torque):
-            obj.set_joint_effort_target(sim_cmd)
+            target_command.set_effort_index(value=sim_cmd)
         elif (self._control_mode == engine.ControlMode.pd_explicit):
-            obj.set_joint_position_target(sim_cmd)
+            target_command.set_position_index(value=sim_cmd)
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
         return
     
     def set_camera_pose(self, pos, look_at):
+        from isaacsim.core.rendering_manager import ViewportManager
+
         env_offset = self._env_offsets[0].cpu().numpy()
         cam_pos = pos.copy()
         cam_look_at = look_at.copy()
 
         cam_pos[:2] += env_offset
         cam_look_at[:2] += env_offset
-        self._sim.set_camera_view(eye=cam_pos, target=cam_look_at)
+        ViewportManager.set_camera_view(CAMERA_PATH, eye=cam_pos, target=cam_look_at)
         return
     
     def get_camera_pos(self):
@@ -241,310 +263,21 @@ class IsaacLabEngine(engine.Engine):
         return self._env_offsets.shape[0]
     
     def get_gravity(self):
-        gravity = np.array(self._sim.cfg.gravity)
-        return gravity
+        return self._gravity
     
     def get_objs_per_env(self):
         return len(self._obj_cfgs[0])
-    
-    def get_root_pos(self, obj_id):
-        obj = self._objs[obj_id]
-        root_pos = obj.data.root_link_pose_w[:, :3].clone()
-        root_pos[:, 0:2] -= self._env_offsets
-        return root_pos
-    
-    def get_root_rot(self, obj_id):
-        obj = self._objs[obj_id]
-        root_rot_wxyz = obj.data.root_link_pose_w[:, 3:]
-        root_rot_xyzw = root_rot_wxyz[:, ROT_WXYZ_TO_XYZW]
-        return root_rot_xyzw
-    
-    def get_root_vel(self, obj_id):
-        obj = self._objs[obj_id]
-        root_vel = obj.data.root_link_vel_w[:, :3]
-        return root_vel
-    
-    def get_root_ang_vel(self, obj_id):
-        obj = self._objs[obj_id]
-        root_ang_vel = obj.data.root_link_vel_w[:, 3:]
-        return root_ang_vel
-    
-    def get_dof_pos(self, obj_id):
-        obj = self._objs[obj_id]
-        dof_pos = obj.data.joint_pos
 
-        dof_order_sim2common = self._dof_order_sim2common[obj_id]
-        dof_pos = dof_pos[:, dof_order_sim2common]
-        return dof_pos
-    
-    def get_dof_vel(self, obj_id):
-        obj = self._objs[obj_id]
-        dof_vel = obj.data.joint_vel
-
-        dof_order_sim2common = self._dof_order_sim2common[obj_id]
-        dof_vel = dof_vel[:, dof_order_sim2common]
-        return dof_vel
-    
-    def get_dof_forces(self, obj_id):
-        obj = self._objs[obj_id]
-        dof_forces = obj.data.applied_torque
-
-        dof_order_sim2common = self._dof_order_sim2common[obj_id]
-        dof_forces = dof_forces[:, dof_order_sim2common]
-        return dof_forces
-    
-    def get_body_pos(self, obj_id):
-        obj = self._objs[obj_id]
-        body_pos = obj.data.body_link_pose_w[:, :, :3].clone()
-
-        body_order_sim2common = self._body_order_sim2common[obj_id]
-        body_pos = body_pos[:, body_order_sim2common, :]
-
-        env_offsets = self._env_offsets.unsqueeze(-2)
-        body_pos[:, :, 0:2] -= env_offsets
-        return body_pos
-    
-    def get_body_rot(self, obj_id):
-        obj = self._objs[obj_id]
-        body_rot = obj.data.body_link_pose_w[:, :, 3:]
-
-        body_order_sim2common = self._body_order_sim2common[obj_id]
-        body_rot_wxyz = body_rot[:, body_order_sim2common, :]
-        body_rot_xyzw = body_rot_wxyz[:, :, ROT_WXYZ_TO_XYZW]
-        return body_rot_xyzw
-    
-    def get_body_vel(self, obj_id):
-        obj = self._objs[obj_id]
-        body_vel = obj.data.body_link_vel_w[:, :, :3]
-
-        body_order_sim2common = self._body_order_sim2common[obj_id]
-        body_vel = body_vel[:, body_order_sim2common, :]
-        return body_vel
-    
-    def get_body_ang_vel(self, obj_id):
-        obj = self._objs[obj_id]
-        body_ang_vel = obj.data.body_link_vel_w[:, :, 3:]
-
-        body_order_sim2common = self._body_order_sim2common[obj_id]
-        body_ang_vel = body_ang_vel[:, body_order_sim2common, :]
-        return body_ang_vel
-    
-    def get_contact_forces(self, obj_id):
-        sensor = self._ground_contact_sensors[obj_id]
-        forces = sensor.data.net_forces_w
-
-        body_order_sim2common = self._sensor_body_order_sim2common[obj_id]
-        forces = forces[:, body_order_sim2common, :]
-        return forces
-    
-    def get_ground_contact_forces(self, obj_id):
-        sensor = self._ground_contact_sensors[obj_id]
-        forces = sensor.data.force_matrix_w
-        forces = forces.sum(dim=-2)
-
-        body_order_sim2common = self._sensor_body_order_sim2common[obj_id]
-        forces = forces[:, body_order_sim2common, :]
-        return forces
-    
-    def set_root_pos(self, env_id, obj_id, root_pos):
-        obj = self._objs[obj_id]
-        root_pos = root_pos.clone()
-
-        if (env_id is None):
-            obj.data.root_link_pose_w[:, :3] = root_pos
-            obj.data.root_link_pose_w[:, :2] += self._env_offsets
-        else:
-            obj.data.root_link_pose_w[env_id, :3] = root_pos
-            obj.data.root_link_pose_w[env_id, :2] += self._env_offsets[env_id]
-        
-        self._flag_obj_needs_reset(env_id, obj_id)
-        return
-    
-    def set_root_rot(self, env_id, obj_id, root_rot):
-        obj = self._objs[obj_id]
-        root_rot_wxyz = root_rot[..., ROT_XYZW_TO_WXYZ]
-
-        if (env_id is None):
-            obj.data.root_link_pose_w[:, 3:] = root_rot_wxyz
-        else:
-            obj.data.root_link_pose_w[env_id, 3:] = root_rot_wxyz
-        
-        self._flag_obj_needs_reset(env_id, obj_id)
-        return
-    
-    def set_root_vel(self, env_id, obj_id, root_vel):
-        obj = self._objs[obj_id]
-
-        if (env_id is None):
-            obj.data.root_link_vel_w[:, :3] = root_vel
-        else:
-            obj.data.root_link_vel_w[env_id, :3] = root_vel
-        
-        self._flag_obj_needs_reset(env_id, obj_id)
-        return
-    
-    def set_root_ang_vel(self, env_id, obj_id, root_ang_vel):
-        obj = self._objs[obj_id]
-
-        if (env_id is None):
-            obj.data.root_link_vel_w[:, 3:] = root_ang_vel
-        else:
-            obj.data.root_link_vel_w[env_id, 3:] = root_ang_vel
-        
-        self._flag_obj_needs_reset(env_id, obj_id)
-        return
-    
-    def set_dof_pos(self, env_id, obj_id, dof_pos):
-        obj = self._objs[obj_id]
-
-        if (not np.isscalar(dof_pos)):
-            dof_order_common2sim = self._dof_order_common2sim[obj_id]
-            dof_pos = dof_pos[..., dof_order_common2sim]
-
-        if (env_id is None):
-            obj.data.joint_pos[:, :] = dof_pos
-        else:
-            obj.data.joint_pos[env_id, :] = dof_pos
-        
-        self._flag_obj_needs_reset(env_id, obj_id)
-        return
-    
-    def set_dof_vel(self, env_id, obj_id, dof_vel):
-        obj = self._objs[obj_id]
-
-        if (not np.isscalar(dof_vel)):
-            dof_order_common2sim = self._dof_order_common2sim[obj_id]
-            dof_vel = dof_vel[..., dof_order_common2sim]
-
-        if (env_id is None):
-            obj.data.joint_vel[:, :] = dof_vel
-        else:
-            obj.data.joint_vel[env_id, :] = dof_vel
-        
-        self._flag_obj_needs_reset(env_id, obj_id)
-        return
-    
-    def set_body_pos(self, env_id, obj_id, body_pos):
-        obj = self._objs[obj_id]
-        body_order_common2sim = self._body_order_common2sim[obj_id]
-        body_pos = body_pos[..., body_order_common2sim, :]
-        
-        if (env_id is None):
-            obj.data.body_link_pose_w[:, :, :3] = body_pos
-            obj.data.body_link_pose_w[:, :, :2] += self._env_offsets.unsqueeze(-2)
-        else:
-            obj.data.body_link_pose_w[env_id, :, :3] = body_pos
-            obj.data.body_link_pose_w[env_id, :, :2] += self._env_offsets[env_id].unsqueeze(-2)
-
-        # don't need to flag reset after setting body states since those 
-        # do not directly affect the simulator
-        return
-    
-    def set_body_rot(self, env_id, obj_id, body_rot):
-        obj = self._objs[obj_id]
-        body_order_common2sim = self._body_order_common2sim[obj_id]
-        body_rot = body_rot[..., body_order_common2sim, :]
-        body_rot_wxyz = body_rot[..., ROT_XYZW_TO_WXYZ]
-        
-        if (env_id is None):
-            obj.data.body_link_pose_w[:, :, 3:] = body_rot_wxyz
-        else:
-            obj.data.body_link_pose_w[env_id, :, 3:] = body_rot_wxyz
-        return
-    
-    def set_body_vel(self, env_id, obj_id, body_vel):
-        obj = self._objs[obj_id]
-
-        if (not np.isscalar(body_vel)):
-            body_order_common2sim = self._body_order_common2sim[obj_id]
-            body_vel = body_vel[..., body_order_common2sim, :]
-        
-        if (env_id is None):
-            obj.data.body_link_vel_w[:, :, :3] = body_vel
-        else:
-            obj.data.body_link_vel_w[env_id, :, :3] = body_vel
-        return
-    
-    def set_body_ang_vel(self, env_id, obj_id, body_ang_vel):
-        obj = self._objs[obj_id]
-        body_order_common2sim = self._body_order_common2sim[obj_id]
-
-        if (not np.isscalar(body_ang_vel)):
-            body_order_common2sim = self._body_order_common2sim[obj_id]
-            body_ang_vel = body_ang_vel[..., body_order_common2sim, :]
-        
-        if (env_id is None):
-            obj.data.body_link_vel_w[:, :, 3:] = body_ang_vel
-        else:
-            obj.data.body_link_vel_w[env_id, :, 3:] = body_ang_vel
-        return
-    
-    def set_body_forces(self, env_id, obj_id, body_id, forces):
-        if (env_id is None or len(env_id) > 0):
-            assert(len(forces.shape) == 2)
-            
-            obj = self._objs[obj_id]
-            obj_type = self.get_obj_type(obj_id)
-            
-            if (obj_type == engine.ObjType.articulated):
-                forces = forces.unsqueeze(-2)
-
-            torques = torch.zeros_like(forces)
-            sim_body_id = self._body_order_sim2common[obj_id][body_id]
-
-            obj.set_external_force_and_torque(forces=forces,
-                                              torques=torques,
-                                              positions=None,
-                                              env_ids=env_id,
-                                              body_ids=sim_body_id,
-                                              is_global=True)
-        return
-    
-    def get_obj_torque_limits(self, env_id, obj_id):
-        obj = self._objs[obj_id]
-        torque_lim = obj.root_physx_view.get_dof_max_forces()[env_id]
-
-        dof_order_sim2common = self._dof_order_sim2common[obj_id].cpu()
-        torque_lim = torque_lim[dof_order_sim2common]
-        return torque_lim.cpu().numpy()
-    
-    def get_obj_dof_limits(self, env_id, obj_id):
-        obj = self._objs[obj_id]
-        dof_limits = obj.root_physx_view.get_dof_limits()[env_id]
-        dof_low = dof_limits[:, 0]
-        dof_high = dof_limits[:, 1]
-
-        dof_order_sim2common = self._dof_order_sim2common[obj_id].cpu()
-        dof_low = dof_low[dof_order_sim2common]
-        dof_high = dof_high[dof_order_sim2common]
-
-        return dof_low.numpy(), dof_high.numpy()
-    
-    def get_obj_pd_gains(self, env_id, obj_id):
-        obj = self._objs[obj_id]
-        actuator = obj.actuators["actuators"]
-        kp = actuator.stiffness[env_id]
-        kd = actuator.damping[env_id]
-
-        dof_order_sim2common = self._dof_order_sim2common[obj_id]
-        kp = kp[dof_order_sim2common]
-        kd = kd[dof_order_sim2common]
-        kp = kp.cpu().numpy()
-        kd = kd.cpu().numpy()
-
-        return kp, kd
-    
-    def find_obj_body_id(self, obj_id, body_name):
-        obj = self._objs[obj_id]
-        meta_data = obj.root_physx_view.shared_metatype
-        body_names = meta_data.link_names
-        sim_body_id = body_names.index(body_name)
-        body_id = self._body_order_common2sim[obj_id][sim_body_id]
-        return body_id
+    def get_control_mode(self):
+        return self._control_mode
     
     def get_obj_type(self, obj_id):
         obj_type = self._obj_cfgs[0][obj_id].obj_type
         return obj_type
+    
+    def get_obj_fix_root(self, obj_id):
+        fix_root = self._obj_cfgs[0][obj_id].fix_root
+        return fix_root
     
     def get_obj_num_bodies(self, obj_id):
         obj = self._objs[obj_id]
@@ -555,29 +288,294 @@ class IsaacLabEngine(engine.Engine):
         obj_type = self.get_obj_type(obj_id)
         if (obj_type == engine.ObjType.articulated):
             obj = self._objs[obj_id]
-            num_dofs = obj.root_physx_view.max_dofs
+            num_dofs = obj.num_joints
         else:
             num_dofs = 0
         return num_dofs
     
     def get_obj_body_names(self, obj_id):
         obj = self._objs[obj_id]
-        meta_data = obj.root_physx_view.shared_metatype
-        body_names = meta_data.link_names
+        body_names = obj.body_names
         body_order_sim2common = self._body_order_sim2common[obj_id]
 
         body_names = [body_names[i] for i in body_order_sim2common.tolist()]
         return body_names
+
+    def get_obj_torque_limits(self, env_id, obj_id):
+        obj = self._objs[obj_id]
+        torque_lim = obj.data.joint_effort_limits.torch[env_id]
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        torque_lim = torque_lim[dof_order_sim2common]
+        return torque_lim.cpu().numpy()
+    
+    def get_obj_dof_limits(self, env_id, obj_id):
+        obj = self._objs[obj_id]
+        dof_limits = obj.data.joint_pos_limits.torch[env_id]
+        dof_low = dof_limits[:, 0]
+        dof_high = dof_limits[:, 1]
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        dof_low = dof_low[dof_order_sim2common]
+        dof_high = dof_high[dof_order_sim2common]
+
+        return dof_low.cpu().numpy(), dof_high.cpu().numpy()
+    
+    def get_obj_pd_gains(self, env_id, obj_id):
+        kp, kd = self._get_sim_pd_gains(obj_id)
+        kp = kp[env_id]
+        kd = kd[env_id]
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        kp = kp[dof_order_sim2common]
+        kd = kd[dof_order_sim2common]
+        kp = kp.cpu().numpy()
+        kd = kd.cpu().numpy()
+
+        return kp, kd
     
     def calc_obj_mass(self, env_id, obj_id):
         obj = self._objs[obj_id]
-        masses = obj.root_physx_view.get_masses()[env_id]
+        masses = obj.data.body_mass.torch[env_id]
         total_mass = masses.sum().item()
         return total_mass
     
-    def get_control_mode(self):
-        return self._control_mode
+    def get_root_pos(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        root_pos = obj.data.root_link_pose_w.torch[env_ids, :3].clone()
+        root_pos[..., 0:2] -= self._env_offsets[env_ids]
+        return root_pos
     
+    def get_root_rot(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        root_rot = obj.data.root_link_pose_w.torch[env_ids, 3:]
+        return root_rot
+    
+    def get_root_vel(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        root_vel = obj.data.root_link_vel_w.torch[env_ids, :3]
+        return root_vel
+    
+    def get_root_ang_vel(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        root_ang_vel = obj.data.root_link_vel_w.torch[env_ids, 3:]
+        return root_ang_vel
+    
+    def get_dof_pos(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        dof_pos = obj.data.joint_pos.torch[env_ids]
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        dof_pos = dof_pos[..., dof_order_sim2common]
+        return dof_pos
+    
+    def get_dof_vel(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        dof_vel = obj.data.joint_vel.torch[env_ids]
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        dof_vel = dof_vel[..., dof_order_sim2common]
+        return dof_vel
+    
+    def get_dof_forces(self, obj_id):
+        obj = self._objs[obj_id]
+        dof_forces = obj.actuators.applied_effort.torch
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        dof_forces = dof_forces[:, dof_order_sim2common]
+        return dof_forces
+    
+    def get_body_pos(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        body_pos = obj.data.body_link_pose_w.torch[env_ids, :, :3]
+
+        body_order_sim2common = self._body_order_sim2common[obj_id]
+        body_pos = body_pos[..., body_order_sim2common, :]
+
+        env_offsets = self._env_offsets[env_ids].unsqueeze(-2)
+        body_pos[..., :, 0:2] -= env_offsets
+        return body_pos
+    
+    def get_body_rot(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        body_rot = obj.data.body_link_pose_w.torch[env_ids, :, 3:]
+
+        body_order_sim2common = self._body_order_sim2common[obj_id]
+        body_rot = body_rot[..., body_order_sim2common, :]
+        return body_rot
+    
+    def get_body_vel(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        body_vel = obj.data.body_link_vel_w.torch[env_ids, :, :3]
+
+        body_order_sim2common = self._body_order_sim2common[obj_id]
+        body_vel = body_vel[..., body_order_sim2common, :]
+        return body_vel
+    
+    def get_body_ang_vel(self, obj_id, env_ids=None):
+        env_ids = engine.none_to_env_ids(env_ids)
+        obj = self._objs[obj_id]
+        body_ang_vel = obj.data.body_link_vel_w.torch[env_ids, :, 3:]
+
+        body_order_sim2common = self._body_order_sim2common[obj_id]
+        body_ang_vel = body_ang_vel[..., body_order_sim2common, :]
+        return body_ang_vel
+    
+    def get_contact_forces(self, obj_id):
+        sensor = self._ground_contact_sensors[obj_id]
+        forces = sensor.data.net_normal_forces_w.torch
+
+        body_order_sim2common = self._sensor_body_order_sim2common[obj_id]
+        forces = forces[:, body_order_sim2common, :]
+        return forces
+    
+    def get_ground_contact_forces(self, obj_id):
+        sensor = self._ground_contact_sensors[obj_id]
+        forces = sensor.data.normal_force_matrix_w.torch
+        forces = forces.sum(dim=-2)
+
+        body_order_sim2common = self._sensor_body_order_sim2common[obj_id]
+        forces = forces[:, body_order_sim2common, :]
+        return forces
+    
+    def set_root_pos(self, env_id, obj_id, root_pos):
+        env_ids = engine.none_to_env_ids(env_id)
+        root_link_pose = self._objs[obj_id].data.root_link_pose_w.torch
+        root_link_pose[env_ids, :3] = root_pos
+        root_link_pose[env_ids, :2] += self._env_offsets[env_ids]
+        
+        self._flag_obj_needs_reset(env_id, obj_id)
+        return
+    
+    def set_root_rot(self, env_id, obj_id, root_rot):
+        env_ids = engine.none_to_env_ids(env_id)
+        root_link_pose = self._objs[obj_id].data.root_link_pose_w.torch
+        root_link_pose[env_ids, 3:] = root_rot
+        
+        self._flag_obj_needs_reset(env_id, obj_id)
+        return
+    
+    def set_root_vel(self, env_id, obj_id, root_vel):
+        env_ids = engine.none_to_env_ids(env_id)
+        root_link_vel = self._objs[obj_id].data.root_link_vel_w.torch
+        root_link_vel[env_ids, :3] = root_vel
+        
+        self._flag_obj_needs_reset(env_id, obj_id)
+        return
+    
+    def set_root_ang_vel(self, env_id, obj_id, root_ang_vel):
+        env_ids = engine.none_to_env_ids(env_id)
+        root_link_vel = self._objs[obj_id].data.root_link_vel_w.torch
+        root_link_vel[env_ids, 3:] = root_ang_vel
+        
+        self._flag_obj_needs_reset(env_id, obj_id)
+        return
+    
+    def set_dof_pos(self, env_id, obj_id, dof_pos):
+        env_ids = engine.none_to_env_ids(env_id)
+        joint_pos = self._objs[obj_id].data.joint_pos.torch
+
+        if (not is_scalar(dof_pos)):
+            dof_order_common2sim = self._dof_order_common2sim[obj_id]
+            dof_pos = dof_pos[..., dof_order_common2sim]
+
+        joint_pos[env_ids] = dof_pos
+        
+        self._flag_obj_needs_reset(env_id, obj_id)
+        return
+    
+    def set_dof_vel(self, env_id, obj_id, dof_vel):
+        env_ids = engine.none_to_env_ids(env_id)
+        joint_vel = self._objs[obj_id].data.joint_vel.torch
+
+        if (not is_scalar(dof_vel)):
+            dof_order_common2sim = self._dof_order_common2sim[obj_id]
+            dof_vel = dof_vel[..., dof_order_common2sim]
+
+        joint_vel[env_ids] = dof_vel
+        
+        self._flag_obj_needs_reset(env_id, obj_id)
+        return
+    
+    def set_body_pos(self, env_id, obj_id, body_pos):
+        env_ids = engine.none_to_env_ids(env_id)
+        body_link_pose = self._objs[obj_id].data.body_link_pose_w.torch
+
+        if (not is_scalar(body_pos)):
+            body_order_common2sim = self._body_order_common2sim[obj_id]
+            body_pos = body_pos[..., body_order_common2sim, :]
+        
+        body_link_pose[env_ids, :, :3] = body_pos
+        body_link_pose[env_ids, :, :2] += self._env_offsets[env_ids].unsqueeze(-2)
+
+        # don't need to flag reset after setting body states since those 
+        # do not directly affect the simulator
+        return
+    
+    def set_body_rot(self, env_id, obj_id, body_rot):
+        env_ids = engine.none_to_env_ids(env_id)
+        body_link_pose = self._objs[obj_id].data.body_link_pose_w.torch
+
+        if (not is_scalar(body_rot)):
+            body_order_common2sim = self._body_order_common2sim[obj_id]
+            body_rot = body_rot[..., body_order_common2sim, :]
+        
+        body_link_pose[env_ids, :, 3:] = body_rot
+        return
+    
+    def set_body_vel(self, env_id, obj_id, body_vel):
+        env_ids = engine.none_to_env_ids(env_id)
+        body_link_vel = self._objs[obj_id].data.body_link_vel_w.torch
+
+        if (not is_scalar(body_vel)):
+            body_order_common2sim = self._body_order_common2sim[obj_id]
+            body_vel = body_vel[..., body_order_common2sim, :]
+        
+        body_link_vel[env_ids, :, :3] = body_vel
+        return
+    
+    def set_body_ang_vel(self, env_id, obj_id, body_ang_vel):
+        env_ids = engine.none_to_env_ids(env_id)
+        body_link_vel = self._objs[obj_id].data.body_link_vel_w.torch
+
+        if (not is_scalar(body_ang_vel)):
+            body_order_common2sim = self._body_order_common2sim[obj_id]
+            body_ang_vel = body_ang_vel[..., body_order_common2sim, :]
+        
+        body_link_vel[env_ids, :, 3:] = body_ang_vel
+        return
+    
+    def set_body_forces(self, env_id, obj_id, body_id, forces):
+        if (env_id is None or len(env_id) > 0):
+            assert(len(forces.shape) == 2)
+            
+            env_ids = engine.none_to_env_ids(env_id)
+            sim_body_id = self._body_order_sim2common[obj_id][body_id]
+            body_forces = self._body_forces[obj_id]
+            body_forces[env_ids, sim_body_id] = forces
+
+            obj = self._objs[obj_id]
+            obj.permanent_wrench_composer.set_forces_and_torques_index(forces=body_forces, is_global=True)
+        return
+    
+    def find_obj_body_id(self, obj_id, body_name):
+        obj = self._objs[obj_id]
+        if (body_name in obj.body_names):
+            sim_body_id = obj.body_names.index(body_name)
+            body_id = int(self._body_order_common2sim[obj_id][sim_body_id])
+        else:
+            body_id = -1
+        return body_id
+
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
         env_offset = self._env_offsets[env_id].cpu().numpy()
         start_pts = start_verts.copy()
@@ -616,30 +614,22 @@ class IsaacLabEngine(engine.Engine):
     
     def _build_ground(self):
         import isaaclab.sim as sim_utils
-        from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-        import omni.kit.commands
+        from isaaclab_physx.sim.spawners.materials import PhysxRigidBodyMaterialCfg
         from pxr import UsdPhysics
 
-        ground_col = np.array([1.0, 0.9, 0.75])
-        ground_col *= 0.017
         ground_path = GROUND_PATH
-
         env_offset_max = torch.max(torch.abs(self._env_offsets)).item()
-        texture_width = 2.0 * env_offset_max + 100.0
+        texture_width = 2.0 * env_offset_max + 1000.0
 
-        physics_material = sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0,
-                                                          restitution=0.0)
-        plane_cfg = GroundPlaneCfg(physics_material=physics_material, color=ground_col,
-                                    size=(texture_width, texture_width))
-        self._ground = spawn_ground_plane(prim_path=ground_path, cfg=plane_cfg)
+        physics_material = PhysxRigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0,
+                                                     restitution=0.0)
+        plane_cfg = sim_utils.GroundPlaneCfg(physics_material=physics_material, color=(1.0, 1.0, 1.0),
+                                             size=(texture_width, texture_width))
+        self._ground = sim_utils.spawn_ground_plane(prim_path=ground_path, cfg=plane_cfg)
 
         # add rigid body schema to terrain to enable contact sensors
         UsdPhysics.RigidBodyAPI.Apply(self._stage.GetPrimAtPath(ground_path))
         UsdPhysics.RigidBodyAPI.Get(self._stage, ground_path).GetKinematicEnabledAttr().Set(True)
-
-        shader_path = ground_path + "/Looks/theGrid/Shader"
-        shader_prim = self._stage.GetPrimAtPath(shader_path)
-        shader_prim.GetAttribute("inputs:albedo_add").Set(10.0)
         return
     
     def _compute_env_offsets(self, num_envs):
@@ -661,34 +651,55 @@ class IsaacLabEngine(engine.Engine):
     
     def _build_lights(self):
         import isaaclab.sim as sim_utils
-        import isaacsim.core.utils.prims as prim_utils
-        from pxr import Gf
 
-        light_quat = torch_util.euler_xyz_to_quat(torch.tensor(0.7),
+        light_quat = torch_util.euler_xyz_to_quat(torch.tensor(0.423),
                                                   torch.tensor(0.0), 
-                                                  torch.tensor(0.6))
-        light_quat = light_quat.tolist()
+                                                  torch.tensor(0.588))
         distant_light_path = LIGHT_PATH + "/distant_light_xform"
-        light_xform = prim_utils.create_prim(distant_light_path, "Xform")
+        sim_utils.create_prim(distant_light_path, "Xform", orientation=light_quat.tolist())
 
-        gf_quatf = Gf.Quatd()
-        gf_quatf.SetReal(light_quat[-1])
-        gf_quatf.SetImaginary(tuple(light_quat[:-1]))
-        light_xform.GetAttribute("xformOp:orient").Set(gf_quatf)
-
-        distant_light_cfg = sim_utils.DistantLightCfg(intensity=2000.0, color=(0.8, 0.8, 0.8))
+        distant_light_cfg = sim_utils.DistantLightCfg(intensity=3800.0, color=(1.0, 0.97, 0.93), angle=8.0)
         self._distant_light = distant_light_cfg.func(distant_light_path + "/distant_light", distant_light_cfg)
 
-        dome_light_cfg = sim_utils.DomeLightCfg(intensity=800.0, color=(0.7, 0.7, 0.7))
+        dome_light_cfg = sim_utils.DomeLightCfg(intensity=420.0, color=(0.82, 0.86, 0.92), visible_in_primary_ray=False)
         self._dome_light = dome_light_cfg.func(LIGHT_PATH + "/dome_light", dome_light_cfg)
+
+        carb_settings = carb.settings.get_settings()
+        carb_settings.set_int("/rtx/background/source/type", 2)
+        carb_settings.set_float_array("/rtx/background/source/color", BACKGROUND_COLOR)
         return
     
     def _build_camera(self):
+        from isaaclab.sim.utils import enable_extension
         from omni.kit.viewport.utility.camera_state import ViewportCameraState
-        self._camera_state = ViewportCameraState("/OmniverseKit_Persp")
+
+        enable_extension("isaacsim.core.rendering_manager")
+        self._camera_state = ViewportCameraState(CAMERA_PATH)
+        return
+
+    def _build_ground_mesh(self):
+        from pxr import Sdf
+
+        texture_file = os.path.abspath(GROUND_TEXTURE_FILE)
+        texture_scale = DEFAULT_GROUND_TEXTURE_SIZE / GROUND_TILE_SIZE
+
+        shader_path = GROUND_PATH + "/Looks/theGrid/Shader"
+        shader_prim = self._stage.GetPrimAtPath(shader_path)
+        shader_prim.GetAttribute("inputs:diffuse_texture").Set(Sdf.AssetPath(texture_file))
+        shader_prim.GetAttribute("inputs:texture_scale").Set((texture_scale, texture_scale))
+        
+        shader_prim.CreateAttribute("inputs:albedo_desaturation", Sdf.ValueTypeNames.Float).Set(0.2)
+        shader_prim.CreateAttribute("inputs:albedo_brightness", Sdf.ValueTypeNames.Float).Set(0.45)
+        shader_prim.CreateAttribute("inputs:albedo_add", Sdf.ValueTypeNames.Float).Set(0.065)
+        shader_prim.GetAttribute("inputs:reflection_roughness_texture_influence").Set(0.0)
+        shader_prim.GetAttribute("inputs:reflection_roughness_constant").Set(0.15)
+        shader_prim.GetAttribute("inputs:specular_level").Set(0.6)
         return
     
     def _build_draw_interface(self):
+        from isaaclab.sim.utils import enable_extension
+
+        enable_extension("isaacsim.util.debug_draw")
         from isaacsim.util.debug_draw import _debug_draw
         self._draw_interface = _debug_draw.acquire_debug_draw_interface()
         return
@@ -704,27 +715,45 @@ class IsaacLabEngine(engine.Engine):
         return
     
     def _create_simulator(self, sim_timestep, visualize, record_video):
-        self._app_launcher = AppLauncher({
+        launcher_args = {
             "headless": not visualize,
             "device": self._device,
             "enable_cameras": record_video or visualize,
-        })
+        }
+        if (visualize):
+            launcher_args["visualizer"] = ["kit"]
+        
+        if (record_video):
+            launcher_args["video"] = True
+            
+        self._app_launcher = AppLauncher(launcher_args)
         
         import isaaclab.sim as sim_utils
-        from isaacsim.core.utils.stage import get_current_stage
+        from isaaclab_physx.physics import PhysxCfg
+        from isaaclab_physx.sim.spawners.materials import PhysxRigidBodyMaterialCfg
         
+        physx_cfg = PhysxCfg(bounce_threshold_velocity=0.2,
+                             max_position_iteration_count=4,
+                             max_velocity_iteration_count=0,
+                             gpu_max_rigid_contact_count=8 * 1024 * 1024,
+                             # disabled to match the PhysX default used with earlier versions of Isaac Lab
+                             enable_external_forces_every_iteration=False)
+        physics_material = PhysxRigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0)
+
+        visualizer_cfgs = []
+        if (visualize):
+            from isaaclab_visualizers.kit import KitVisualizerCfg
+            visualizer_cfgs.append(KitVisualizerCfg(background_color=None))
+
         sim_cfg = sim_utils.SimulationCfg(device=self._device, dt=sim_timestep,
-                                          render_interval=self._sim_steps)
-        
-        sim_cfg.physx.bounce_threshold_velocity = 0.2
-        sim_cfg.physx.max_position_iteration_count = 4
-        sim_cfg.physx.max_velocity_iteration_count = 0
-        sim_cfg.physx.gpu_max_rigid_contact_count = 8 * 1024 * 1024
-        sim_cfg.physics_material.static_friction = 1.0
-        sim_cfg.physics_material.dynamic_friction = 1.0
+                                          render_interval=self._sim_steps,
+                                          physics=physx_cfg,
+                                          physics_material=physics_material,
+                                          visualizer_cfgs=visualizer_cfgs,
+                                          use_newton_actuators=False)
         
         self._sim = sim_utils.SimulationContext(sim_cfg)
-        self._stage = get_current_stage()
+        self._stage = sim_utils.get_current_stage()
         
         # disable delays during rendering
         carb_settings = carb.settings.get_settings()
@@ -736,7 +765,7 @@ class IsaacLabEngine(engine.Engine):
     
     def _parse_usd_path(self, asset_file):
         asset_root, asset_ext = os.path.splitext(asset_file)
-        if (asset_ext != "usd" and asset_ext != "usda"):
+        if (asset_ext != ".usd" and asset_ext != ".usda"):
             asset_file = asset_root + ".usd"
         return asset_file
     
@@ -754,7 +783,7 @@ class IsaacLabEngine(engine.Engine):
         elif (control_mode == engine.ControlMode.pd_explicit):
             actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"], stiffness=None, damping=None, effort_limit=None)
         else:
-            assert(False), "Unsupported control mode: {}".format(self._control_mode)
+            assert(False), "Unsupported control mode: {}".format(control_mode)
 
         return actuator_cfg
 
@@ -762,7 +791,18 @@ class IsaacLabEngine(engine.Engine):
         num_objs = self.get_objs_per_env()
         for obj_id in range(num_objs):
             obj = self._objs[obj_id]
+
+            if (self.get_obj_type(obj_id) == engine.ObjType.articulated):
+                self._refresh_joint_pos(obj)
+
             obj.write_data_to_sim()
+        return
+
+    def _refresh_joint_pos(self, obj):
+        # Isaac Lab only reads the joint positions from the simulator when they are accessed.
+        # Accessing them here keeps the torques of the implicit actuators, which are computed
+        # in write_data_to_sim() and returned by get_dof_forces(), consistent with the current sim step.
+        obj.data.joint_pos
         return
 
     def _sim_step(self):
@@ -781,13 +821,10 @@ class IsaacLabEngine(engine.Engine):
         return
 
     def _clear_forces(self):
-        for obj in self._objs:
-            if (getattr(obj, "has_external_wrentch", False)):
-                forces = torch.zeros([1, 3], dtype=torch.float, device=self._device)
-                torques = torch.zeros([1, 3], dtype=torch.float, device=self._device)
-                obj.set_external_force_and_torque(forces=forces, torques=torques,
-                                                  positions=None, env_ids=None,
-                                                  body_ids=None, is_global=True)
+        for obj_id, obj in enumerate(self._objs):
+            if (obj.permanent_wrench_composer.active):
+                obj.permanent_wrench_composer.reset()
+                self._body_forces[obj_id][:] = 0.0
         return
     
     def _validate_envs(self):
@@ -802,14 +839,9 @@ class IsaacLabEngine(engine.Engine):
     
     def _build_envs(self):
         num_envs = self.get_num_envs()
-        source_env_path = ENV_PATH_TEMPLATE.format(0)
-        self._stage.DefinePrim(source_env_path, "Xform")
-
-        clone_paths = [ENV_PATH_TEMPLATE.format(i) for i in range(1, num_envs)]
-        self._cloner.clone(source_prim_path=source_env_path,
-                           prim_paths=clone_paths,
-                           replicate_physics=False,
-                           copy_from_source=True)
+        for i in range(num_envs):
+            env_path = ENV_PATH_TEMPLATE.format(i)
+            self._stage.DefinePrim(env_path, "Xform")
         return
     
     def _build_objs(self):
@@ -865,28 +897,34 @@ class IsaacLabEngine(engine.Engine):
     def _build_obj_prim(self, env_id, obj_id, obj_cfg):
         obj_type = obj_cfg.obj_type
         if (obj_type == engine.ObjType.rigid):
-            multi_obj_prim = self._build_rigid_prim(env_id, obj_id, obj_cfg)
+            self._build_rigid_prim(env_id, obj_id, obj_cfg)
         elif (obj_type == engine.ObjType.articulated):
-            multi_obj_prim = self._build_articulated_prim(env_id, obj_id, obj_cfg)
+            self._build_articulated_prim(env_id, obj_id, obj_cfg)
         else:
             assert(False), "Unsupported obj type: {}".format(obj_type.name)
-        return multi_obj_prim
+        return
 
-    def _build_rigid_prim(self, env_id, obj_id, obj_cfg):
+    def _build_visual_material(self, obj_cfg):
         import isaaclab.sim as sim_utils
-        from isaaclab.assets import RigidObject, RigidObjectCfg
         
         color = obj_cfg.color
         if (color is not None):
-            visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(color[0], color[1], color[2]), metallic=0.5)
+            visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(color[0], color[1], color[2]),
+                                                          metallic=0.0, roughness=0.3)
         else:
             visual_material = None
+        return visual_material
+    
+    def _build_rigid_prim(self, env_id, obj_id, obj_cfg):
+        import isaaclab.sim as sim_utils
+        from isaaclab_physx.sim.schemas import PhysxRigidBodyPropertiesCfg
 
-        rigid_props = sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=obj_cfg.fix_root,
-                                                       max_depenetration_velocity=10.0,
-                                                       angular_damping=0.01,
-                                                       max_linear_velocity=1000.0,
-                                                       max_angular_velocity=1000.0)
+        visual_material = self._build_visual_material(obj_cfg)
+        rigid_props = PhysxRigidBodyPropertiesCfg(kinematic_enabled=obj_cfg.fix_root,
+                                                  max_depenetration_velocity=10.0,
+                                                  angular_damping=0.01,
+                                                  max_linear_velocity=1000.0,
+                                                  max_angular_velocity=1000.0)
         usd_asset_file = self._parse_usd_path(obj_cfg.asset_file)
         usd_cfg = sim_utils.UsdFileCfg(usd_path=usd_asset_file, 
                                        visual_material=visual_material, 
@@ -894,28 +932,18 @@ class IsaacLabEngine(engine.Engine):
                                        activate_contact_sensors=True)
         
         prim_path = OBJ_PATH_TEMPLATE.format(env_id, obj_id)
-        init_state = RigidObjectCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot)
-        
-        rigid_cfg = RigidObjectCfg(prim_path=prim_path, spawn=usd_cfg, collision_group=0,
-                                 init_state=init_state)
-        prim = RigidObject(rigid_cfg)
+        usd_cfg.func(prim_path, usd_cfg, translation=obj_cfg.start_pos.tolist(), orientation=obj_cfg.start_rot.tolist())
 
         if (obj_cfg.is_visual):
             self._disable_prim_collisions(prim_path)
-
-        return prim
+        return
     
     def _build_articulated_prim(self, env_id, obj_id, obj_cfg):
         import isaaclab.sim as sim_utils
-        from isaaclab.assets import Articulation, ArticulationCfg
+        from isaaclab_physx.sim.schemas import PhysxArticulationRootPropertiesCfg, PhysxRigidBodyPropertiesCfg
 
-        color = obj_cfg.color
-        if (color is not None):
-            visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(color[0], color[1], color[2]), metallic=0.5)
-        else:
-            visual_material = None
-
-        articulation_props = sim_utils.ArticulationRootPropertiesCfg(
+        visual_material = self._build_visual_material(obj_cfg)
+        articulation_props = PhysxArticulationRootPropertiesCfg(
                     enabled_self_collisions=obj_cfg.enable_self_collisions, 
                     fix_root_link=obj_cfg.fix_root)
         
@@ -930,26 +958,12 @@ class IsaacLabEngine(engine.Engine):
                                        rigid_props=rigid_props,
                                        activate_contact_sensors=True)
 
-        if (obj_cfg.disable_motors):
-            control_mode = engine.ControlMode.none
-        else:
-            control_mode = self.get_control_mode()
-
-        actuator_cfg = self._build_actuator_cfg(control_mode)
-
         prim_path = OBJ_PATH_TEMPLATE.format(env_id, obj_id)
-        init_state = ArticulationCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot)
-        
-        art_cfg = ArticulationCfg(prim_path=prim_path, spawn=usd_cfg, collision_group=0,
-                                  init_state=init_state,
-                                  actuator_value_resolution_debug_print=False,
-                                  actuators={"actuators": actuator_cfg})
-        prim = Articulation(art_cfg)
+        usd_cfg.func(prim_path, usd_cfg, translation=obj_cfg.start_pos.tolist(), orientation=obj_cfg.start_rot.tolist())
 
         if (obj_cfg.is_visual):
             self._disable_prim_collisions(prim_path)
-
-        return prim
+        return
     
     def _build_multi_obj_prim(self, obj_id, obj_cfg):
         obj_type = obj_cfg.obj_type
@@ -971,8 +985,9 @@ class IsaacLabEngine(engine.Engine):
         return multi_obj_prim
 
     def _build_multi_articulated_prim(self, obj_id, obj_cfg):
-        from isaaclab.assets import Articulation, ArticulationCfg
-
+        from isaaclab.assets import ArticulationCfg
+        from isaaclab_physx.assets import Articulation
+        
         if (obj_cfg.disable_motors):
             control_mode = engine.ControlMode.none
         else:
@@ -981,35 +996,34 @@ class IsaacLabEngine(engine.Engine):
         actuator_cfg = self._build_actuator_cfg(control_mode)
 
         regex = OBJ_PATH_TEMPLATE.format(".*", obj_id)
-        multi_obj_cfg = ArticulationCfg(prim_path=regex, spawn=None, actuators={"actuators": actuator_cfg})
-        multi_obj_prim = Articulation(multi_obj_cfg)
+        multi_obj_cfg = ArticulationCfg(prim_path=regex, spawn=None,
+                                        actuator_value_resolution_debug_print=False,
+                                        actuators={ACTUATOR_GROUP: actuator_cfg})
+
+        class UncheckedArticulation(Articulation):
+            # Override Isaac Lab error when default joint positions are outside of joint limits
+            # this is the case for some characters, but should not cause problems with the simulation
+            def _validate_cfg(self):
+                return
+        
+        multi_obj_prim = UncheckedArticulation(multi_obj_cfg)
 
         return multi_obj_prim
     
     def _clone_obj_prim(self, source_env_id, obj_id, clone_env_ids):
-        clone_paths = []
-        clone_positions = []
-        clone_rotations = []
+        import isaaclab.sim as sim_utils
+        from isaaclab.cloner import usd_replicate
+
+        source_path = OBJ_PATH_TEMPLATE.format(source_env_id, obj_id)
+        clone_path_template = OBJ_PATH_TEMPLATE.format("{}", obj_id)
+        usd_replicate(self._stage, sources=[source_path], destinations=[clone_path_template],
+                      env_ids=torch.tensor(clone_env_ids))
 
         for clone_env_id in clone_env_ids:
             clone_cfg = self._obj_cfgs[clone_env_id][obj_id]
-            clone_rot = clone_cfg.start_rot
-            clone_pos = clone_cfg.start_pos
-
-            clone_path = OBJ_PATH_TEMPLATE.format(clone_env_id, obj_id)
-            clone_paths.append(clone_path)
-            clone_positions.append(clone_pos)
-            clone_rotations.append(clone_rot)
-
-        clone_positions = np.stack(clone_positions)
-        clone_rotations = np.stack(clone_rotations)
-        
-        source_path = OBJ_PATH_TEMPLATE.format(source_env_id, obj_id)
-        self._cloner.clone(source_prim_path=source_path,
-                           prim_paths=clone_paths,
-                           positions=clone_positions,
-                           orientations=clone_rotations,
-                           copy_from_source=True)
+            clone_prim = self._stage.GetPrimAtPath(OBJ_PATH_TEMPLATE.format(clone_env_id, obj_id))
+            sim_utils.standardize_xform_ops(clone_prim, translation=clone_cfg.start_pos.tolist(),
+                                            orientation=clone_cfg.start_rot.tolist())
         return
     
     def _disable_prim_collisions(self, prim_path):
@@ -1020,9 +1034,20 @@ class IsaacLabEngine(engine.Engine):
             if (col_prim.IsInstanceable()):
                 col_prim.SetInstanceable(False)
 
-        collision_props = sim_utils.CollisionPropertiesCfg(collision_enabled=False)
+        collision_props = sim_utils.schemas.CollisionBaseCfg(collision_enabled=False)
         sim_utils.schemas.modify_collision_properties(prim_path, collision_props)
         return
+
+    def _get_sim_pd_gains(self, obj_id):
+        obj = self._objs[obj_id]
+        if (obj.actuators.has_implicit_actuators):
+            kp = obj.data.joint_stiffness.torch
+            kd = obj.data.joint_damping.torch
+        else:
+            actuator = obj.actuators[ACTUATOR_GROUP]
+            kp = actuator.stiffness
+            kd = actuator.damping
+        return kp, kd
     
     def _build_body_order_tensors(self):
         self._body_order_sim2common = []
@@ -1105,7 +1130,7 @@ class IsaacLabEngine(engine.Engine):
         return
     
     def _build_body_order(self, obj):
-        meta_data = obj.root_physx_view.shared_metatype
+        meta_data = obj.root_view.shared_metatype
         link_names = meta_data.link_names
         link_parent_indices = meta_data.link_parent_indices
         joint_dof_counts = meta_data.joint_dof_counts
@@ -1143,22 +1168,29 @@ class IsaacLabEngine(engine.Engine):
         num_envs = self.get_num_envs()
         num_objs = self.get_objs_per_env()
         self._objs_need_reset = torch.zeros([num_envs, num_objs], device=self._device, dtype=torch.bool)
+
+        self._body_forces = []
+        for obj_id in range(num_objs):
+            num_bodies = self.get_obj_num_bodies(obj_id)
+            body_forces = torch.zeros([num_envs, num_bodies, 3], device=self._device, dtype=torch.float)
+            self._body_forces.append(body_forces)
         return
     
     def _filter_env_collisions(self):
+        from isaaclab.cloner import filter_collisions
+
         num_envs = self.get_num_envs()
-        physics_scene_path = self._physics_scene_path()
+        physics_scene_path = self._sim.cfg.physics_prim_path
         env_prim_paths = [ENV_PATH_TEMPLATE.format(i) for i in range(num_envs)]
 
-        self._cloner.filter_collisions(physics_scene_path, "/World/collisions",
-                                       env_prim_paths, global_paths=[])
+        filter_collisions(self._stage, physics_scene_path, COLLISION_ROOT_PATH,
+                          env_prim_paths, global_paths=[])
         return
     
     def _flag_obj_needs_reset(self, env_id, obj_id):
-        if (env_id is None):
-            self._objs_need_reset[:, obj_id] = True
-        elif (len(env_id) > 0):
-            self._objs_need_reset[env_id, obj_id] = True
+        if (env_id is None or len(env_id) > 0):
+            env_ids = engine.none_to_env_ids(env_id)
+            self._objs_need_reset[env_ids, obj_id] = True
         return
     
     def _update_reset_objs(self):
@@ -1167,7 +1199,7 @@ class IsaacLabEngine(engine.Engine):
         for obj_id in range(num_objs):
             reset_flags = self._objs_need_reset[:, obj_id]
             env_ids = reset_flags.nonzero(as_tuple=False)
-            env_ids = env_ids.type(torch.int32).flatten()
+            env_ids = env_ids.flatten()
 
             if (len(env_ids) > 0):
                 self._reset_obj(obj_id, env_ids)
@@ -1178,16 +1210,18 @@ class IsaacLabEngine(engine.Engine):
         obj = self._objs[obj_id]
         obj_type = self.get_obj_type(obj_id)
 
-        root_pose_data = obj.data.root_link_pose_w[env_ids]
-        root_vel_data = obj.data.root_link_vel_w[env_ids]
-        obj.write_root_link_pose_to_sim(root_pose_data, env_ids)
-        obj.write_root_link_velocity_to_sim(root_vel_data, env_ids)
+        root_pose_data = obj.data.root_link_pose_w.torch[env_ids]
+        root_vel_data = obj.data.root_link_vel_w.torch[env_ids]
 
         if (obj_type == engine.ObjType.articulated):
-            dof_pos_data = obj.data.joint_pos[env_ids]
-            dof_vel_data = obj.data.joint_vel[env_ids]
-            obj.write_joint_position_to_sim(dof_pos_data, env_ids=env_ids)
-            obj.write_joint_velocity_to_sim(dof_vel_data, env_ids=env_ids)
+            dof_pos_data = obj.data.joint_pos.torch[env_ids]
+            dof_vel_data = obj.data.joint_vel.torch[env_ids]
+
+        obj.write_root_link_pose_to_sim_index(root_pose=root_pose_data, env_ids=env_ids)
+        self._write_root_link_vel_to_sim(obj, root_vel_data, env_ids)
+
+        if (obj_type == engine.ObjType.articulated):
+            obj.write_joint_state_to_sim_index(position=dof_pos_data, velocity=dof_vel_data, env_ids=env_ids)
 
         obj.reset(env_ids)
 
@@ -1195,20 +1229,21 @@ class IsaacLabEngine(engine.Engine):
         if (ground_contact_sensor is not None):
             ground_contact_sensor.reset(env_ids)
         return
-    
-    def _physics_scene_path(self):
-        from pxr import PhysxSchema
 
-        physics_scene_path = None
-        for prim in self._stage.Traverse():
-            if prim.HasAPI(PhysxSchema.PhysxSceneAPI):
-                physics_scene_path = prim.GetPrimPath().pathString
-                break
+    def _write_root_link_vel_to_sim(self, obj, root_vel, env_ids):
+        # jp hack: this should be removed once Isaac fixes this bug in a new version
+        # Isaac Lab 3.0.0-EA writes the root link velocity of articulations to the simulator
+        # without converting it to the velocity of the root's center of mass, which is the velocity
+        # used by PhysX, so the conversion is done here before writing the center of mass velocity
+        root_pos = obj.data.root_link_pose_w.torch[env_ids, :3]
+        root_com_pos = obj.data.root_com_pose_w.torch[env_ids, :3]
+        lin_vel = root_vel[:, :3]
+        ang_vel = root_vel[:, 3:]
 
-        if (physics_scene_path is None):
-            assert(False), "No physics scene found! Please make sure one exists."
-        
-        return physics_scene_path
+        com_lin_vel = lin_vel + torch.cross(ang_vel, root_com_pos - root_pos, dim=-1)
+        root_com_vel = torch.cat([com_lin_vel, ang_vel], dim=-1)
+        obj.write_root_com_velocity_to_sim_index(root_velocity=root_com_vel, env_ids=env_ids)
+        return
     
     def _find_contact_prim_path(self, obj_path):
         from pxr import PhysxSchema
@@ -1240,4 +1275,19 @@ class IsaacLabEngine(engine.Engine):
     def _build_video_recorder(self):
         self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self)
         Logger.print("Video recording enabled")
+        return
+
+    def _hide_unrecorded_envs(self):
+        from pxr import UsdGeom
+
+        visible_env_radius = 20.0
+        env_dist = torch.linalg.norm(self._env_offsets - self._env_offsets[0], dim=-1)
+        hidden_env_ids = torch.nonzero(env_dist > visible_env_radius).squeeze(-1).tolist()
+
+        for env_id in hidden_env_ids:
+            env_prim = self._stage.GetPrimAtPath(ENV_PATH_TEMPLATE.format(env_id))
+            UsdGeom.Imageable(env_prim).MakeInvisible()
+
+        num_visible = self.get_num_envs() - len(hidden_env_ids)
+        Logger.print("Rendering {:d}/{:d} envs for video recording".format(num_visible, self.get_num_envs()))
         return

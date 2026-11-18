@@ -192,12 +192,15 @@ class TaskDodgeballEnv(smp_env.SMPEnv):
 
         return proj_pos, proj_vel
 
+    # not compiled since it writes into the engine's sim state which torch.compile (Inductor) fails to compile,
+    # and the number of launched projectiles changes every step, which would trigger recompilations
+    @torch.compiler.disable
     def _launch_projectiles(self, env_ids, proj_ids):
         n = env_ids.shape[0]
         if (n > 0):
             char_id = self._get_char_id()
-            char_body_pos = self._engine.get_body_pos(char_id)[env_ids]
-            char_body_vel = self._engine.get_body_vel(char_id)[env_ids]
+            char_body_pos = self._engine.get_body_pos(char_id, env_ids)
+            char_body_vel = self._engine.get_body_vel(char_id, env_ids)
 
             target_pos = char_body_pos[:, self._proj_target_body_id, :].clone()
             target_pos += self._proj_aim_noise_scale * torch.randn_like(target_pos)
@@ -227,19 +230,22 @@ class TaskDodgeballEnv(smp_env.SMPEnv):
             self._proj_trigger_times[env_ids, proj_ids] = self._time_buf[env_ids] + rand_dt
         return
 
+    @torch.compile
     def _compute_obs(self, env_ids=None):
         obs = super()._compute_obs(env_ids)
 
         char_id = self._get_char_id()
-        root_pos = self._engine.get_root_pos(char_id)
-        root_rot = self._engine.get_root_rot(char_id)
-        proj_pos, proj_vel = self._get_proj_states()
+        root_pos = self._engine.get_root_pos_obs(char_id, env_ids)
+        root_rot = self._engine.get_root_rot_obs(char_id, env_ids)
 
-        if (env_ids is not None):
-            root_pos = root_pos[env_ids]
-            root_rot = root_rot[env_ids]
-            proj_pos = proj_pos[env_ids]
-            proj_vel = proj_vel[env_ids]
+        proj_pos = []
+        proj_vel = []
+        for proj_id in self._proj_ids:
+            proj_pos.append(self._engine.get_root_pos_obs(proj_id, env_ids))
+            proj_vel.append(self._engine.get_root_vel_obs(proj_id, env_ids))
+
+        proj_pos = torch.stack(proj_pos, dim=-2)
+        proj_vel = torch.stack(proj_vel, dim=-2)
 
         task_obs = compute_dodgeball_observations(root_pos=root_pos,
                                               root_rot=root_rot,
@@ -285,9 +291,7 @@ class TaskDodgeballEnv(smp_env.SMPEnv):
 ###=========================jit functions=========================###
 #####################################################################
 
-@torch.jit.script
 def compute_dodgeball_observations(root_pos, root_rot, proj_pos, proj_vel):
-    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
     heading_inv_rot = heading_inv_rot.unsqueeze(-2).repeat((1, proj_pos.shape[1], 1))
 
@@ -301,11 +305,9 @@ def compute_dodgeball_observations(root_pos, root_rot, proj_pos, proj_vel):
     obs = proj_obs_flat
     return obs
 
-@torch.jit.script
 def compute_dodgeball_fail_flags(body_pos, proj_pos, proj_vel, prev_proj_vel, proj_contact_force,
                                  hit_dist, hit_force_threshold,
                                  hit_delta_v_threshold, gravity, dt):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float, float) -> Tensor
 
     proj_body_delta = proj_pos.unsqueeze(-2) - body_pos.unsqueeze(-3)
     proj_around_body = torch.linalg.norm(proj_body_delta, dim=-1) < hit_dist
@@ -325,9 +327,7 @@ def compute_dodgeball_fail_flags(body_pos, proj_pos, proj_vel, prev_proj_vel, pr
 
     return hit_fail
 
-@torch.jit.script
 def compute_dodge_reward(root_pos, root_vel, proj_pos):
-    # type: (Tensor, Tensor, Tensor) -> Tensor
     pos_w = 0.9
     vel_w = 0.1
 

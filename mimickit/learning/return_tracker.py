@@ -4,7 +4,7 @@ import envs.base_env as base_env
 
 class ReturnTracker():
     def __init__(self, num_envs, device):
-        self._episodes = 0
+        self._episodes = torch.zeros([1], device=device, dtype=torch.long)
         self._mean_return = torch.zeros([1], device=device, dtype=torch.float32)
         self._mean_ep_len = torch.zeros([1], device=device, dtype=torch.float32)
 
@@ -20,22 +20,23 @@ class ReturnTracker():
         return self._mean_ep_len
 
     def get_episodes(self):
-        return self._episodes
+        return self._episodes.item()
 
     def get_eps_per_env(self):
         return self._eps_per_env_buf
 
     def reset(self):
-        self._episodes = 0
-        self._eps_per_env_buf[:] = 0
+        self._episodes.zero_()
+        self._eps_per_env_buf.zero_()
 
-        self._mean_return[:] = 0.0
-        self._mean_ep_len[:] = 0.0
+        self._mean_return.zero_()
+        self._mean_ep_len.zero_()
 
-        self._return_buf[:] = 0.0
-        self._ep_len_buf[:] = 0
+        self._return_buf.zero_()
+        self._ep_len_buf.zero_()
         return
 
+    @torch.compile
     def update(self, reward, done):
         assert(reward.shape == self._return_buf.shape)
         assert(done.shape == self._return_buf.shape)
@@ -43,24 +44,23 @@ class ReturnTracker():
         self._return_buf += reward
         self._ep_len_buf += 1
 
+        # masked updates avoid a GPU-CPU sync on every step
         reset_mask = done != base_env.DoneFlags.NULL.value
-        reset_ids = reset_mask.nonzero(as_tuple=False).flatten()
-        num_resets = len(reset_ids)
+        num_resets = torch.sum(reset_mask)
+        denom = torch.clamp_min(num_resets, 1)
 
-        if (num_resets > 0):
-            new_mean_return = torch.mean(self._return_buf[reset_ids])
-            new_mean_ep_len = torch.mean(self._ep_len_buf[reset_ids].type(torch.float))
+        new_mean_return = torch.sum(torch.where(reset_mask, self._return_buf, 0.0)) / denom
+        new_mean_ep_len = torch.sum(torch.where(reset_mask, self._ep_len_buf, 0)) / denom
 
-            new_count = self._episodes + num_resets
-            w_new = float(num_resets) / new_count
-            w_old = float(self._episodes) / new_count
+        new_count = torch.clamp_min(self._episodes + num_resets, 1)
+        w_new = num_resets / new_count
+        w_old = self._episodes / new_count
 
-            self._mean_return = w_new * new_mean_return + w_old * self._mean_return
-            self._mean_ep_len = w_new * new_mean_ep_len + w_old * self._mean_ep_len
-            self._episodes += num_resets
+        self._mean_return = w_new * new_mean_return + w_old * self._mean_return
+        self._mean_ep_len = w_new * new_mean_ep_len + w_old * self._mean_ep_len
+        self._episodes += num_resets
 
-            self._return_buf[reset_ids] = 0.0
-            self._ep_len_buf[reset_ids] = 0
-            self._eps_per_env_buf[reset_ids] += 1
-
+        self._return_buf.masked_fill_(reset_mask, 0.0)
+        self._ep_len_buf.masked_fill_(reset_mask, 0)
+        self._eps_per_env_buf += reset_mask
         return

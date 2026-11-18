@@ -22,6 +22,7 @@ steps_per_iter: 32
 iters_per_output: 200
 test_episodes: 32
 normalizer_samples: 100000000
+use_mixed_precision: false
 
 actor_epochs: 5
 actor_batch_size: 4

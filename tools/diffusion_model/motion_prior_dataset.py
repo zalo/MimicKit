@@ -16,11 +16,11 @@ import anim.motion_lib as motion_lib
 from tools.util.char_vis_util import output_body_pos_anim
 
 class MotionPriorData:
-    def __init__(self, config):
+    def __init__(self, config, device):
         with open(config["env_config"], "r") as stream:
             env_config = yaml.safe_load(stream)
         
-        self._device = config["device"]
+        self._device = device
         self._global_obs = env_config["global_obs"]
         self._root_height_obs = env_config.get("root_height_obs", True)
 

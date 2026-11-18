@@ -84,10 +84,10 @@ class PPOAgent(base_agent.BaseAgent):
         elif (self._mode == base_agent.AgentMode.TEST):
             norm_a = norm_action_dist.mode
             rand_action_mask = torch.zeros_like(norm_a[..., 0])
-            
+
         else:
             assert(False), "Unsupported agent mode: {}".format(self._mode)
-            
+
         norm_a_logp = norm_action_dist.log_prob(norm_a)
 
         norm_a = norm_a.detach()
@@ -122,11 +122,11 @@ class PPOAgent(base_agent.BaseAgent):
 
         succ_val = self._compute_succ_val()
         succ_mask = (done == base_env.DoneFlags.SUCC.value)
-        next_vals[succ_mask] = succ_val
+        next_vals = torch.where(succ_mask, succ_val, next_vals)
 
         fail_val = self._compute_fail_val()
         fail_mask = (done == base_env.DoneFlags.FAIL.value)
-        next_vals[fail_mask] = fail_val
+        next_vals = torch.where(fail_mask, fail_val, next_vals)
 
         new_vals = rl_util.compute_td_lambda_return(r, next_vals, done, self._discount, self._td_lambda)
 
@@ -183,11 +183,15 @@ class PPOAgent(base_agent.BaseAgent):
 
     def _update_critic(self, batch_size, steps):
         info = dict()
+        device_type = torch.device(self._device).type
 
         for i in range(steps):
             batch = self._exp_buffer.sample(batch_size)
-            loss_info = self._compute_critic_loss(batch)
-            loss = loss_info["critic_loss"]
+
+            with torch.amp.autocast(device_type=device_type, enabled=self._use_mixed_precision, dtype=torch.bfloat16):
+                loss_info = self._compute_critic_loss(batch)
+                loss = loss_info["critic_loss"]
+            
             self._critic_optimizer.step(loss)
 
             torch_util.add_torch_dict(loss_info, info)
@@ -197,11 +201,15 @@ class PPOAgent(base_agent.BaseAgent):
 
     def _update_actor(self, batch_size, num_steps):
         info = dict()
+        device_type = torch.device(self._device).type
 
         for i in range(num_steps):
             batch = self._exp_buffer.sample(batch_size)
-            loss_info = self._compute_actor_loss(batch)
-            loss = loss_info["actor_loss"]
+
+            with torch.amp.autocast(device_type=device_type, enabled=self._use_mixed_precision, dtype=torch.bfloat16):
+                loss_info = self._compute_actor_loss(batch)
+                loss = loss_info["actor_loss"]
+
             self._actor_optimizer.step(loss)
 
             torch_util.add_torch_dict(loss_info, info)
@@ -209,6 +217,7 @@ class PPOAgent(base_agent.BaseAgent):
         torch_util.scale_torch_dict(1.0 / num_steps, info)
         return info
     
+    @torch.compile
     def _compute_critic_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
         tar_val = batch["tar_val"]
@@ -223,6 +232,7 @@ class PPOAgent(base_agent.BaseAgent):
         }
         return info
 
+    @torch.compile
     def _compute_actor_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
         norm_a = self._a_norm.normalize(batch["action"])
@@ -230,12 +240,11 @@ class PPOAgent(base_agent.BaseAgent):
         adv = batch["adv"]
         rand_action_mask = batch["rand_action_mask"]
 
-        # loss should only be computed using samples with random actions
+        # loss should only be computed using samples with random actions,
         rand_action_mask = (rand_action_mask == 1.0)
-        norm_obs = norm_obs[rand_action_mask]
-        norm_a = norm_a[rand_action_mask]
-        old_a_logp = old_a_logp[rand_action_mask]
-        adv = adv[rand_action_mask]
+        num_rand_actions = torch.sum(rand_action_mask)
+        def masked_mean(x): 
+            return torch.sum(torch.where(rand_action_mask, x, 0.0)) / num_rand_actions
 
         a_dist = self._model.eval_actor(norm_obs)
         a_logp = a_dist.log_prob(norm_a)
@@ -244,11 +253,11 @@ class PPOAgent(base_agent.BaseAgent):
         actor_loss0 = adv * a_ratio
         actor_loss1 = adv * torch.clamp(a_ratio, 1.0 - self._ppo_clip_ratio, 1.0 + self._ppo_clip_ratio)
         actor_loss = torch.minimum(actor_loss0, actor_loss1)
-        actor_loss = -torch.mean(actor_loss)
+        actor_loss = -masked_mean(actor_loss)
         
         clip_frac = (torch.abs(a_ratio - 1.0) > self._ppo_clip_ratio).type(torch.float)
-        clip_frac = torch.mean(clip_frac)
-        imp_ratio = torch.mean(a_ratio)
+        clip_frac = masked_mean(clip_frac)
+        imp_ratio = masked_mean(a_ratio)
         
         info = {
             "actor_loss": actor_loss,
@@ -259,19 +268,19 @@ class PPOAgent(base_agent.BaseAgent):
         if (self._action_bound_weight != 0):
             action_bound_loss = self._compute_action_bound_loss(a_dist)
             if (action_bound_loss is not None):
-                action_bound_loss = torch.mean(action_bound_loss)
+                action_bound_loss = masked_mean(action_bound_loss)
                 actor_loss += self._action_bound_weight * action_bound_loss
                 info["action_bound_loss"] = action_bound_loss.detach()
 
         if (self._action_entropy_weight != 0):
             action_entropy = a_dist.entropy()
-            action_entropy = torch.mean(action_entropy)
+            action_entropy = masked_mean(action_entropy)
             actor_loss += -self._action_entropy_weight * action_entropy
             info["action_entropy"] = action_entropy.detach()
         
         if (self._action_reg_weight != 0):
             action_reg_loss = a_dist.param_reg()
-            action_reg_loss = torch.mean(action_reg_loss)
+            action_reg_loss = masked_mean(action_reg_loss)
             actor_loss += self._action_reg_weight * action_reg_loss
             info["action_reg_loss"] = action_reg_loss.detach()
         

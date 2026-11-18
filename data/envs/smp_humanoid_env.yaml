@@ -23,3 +23,6 @@ contact_bodies: ["right_foot", "left_foot"]
 #contact_bodies: [] # roll and crawl
 
 motion_file: "data/motions/humanoid/humanoid_spinkick.pkl"
+
+engine:
+    base_links: ["pelvis", "torso", "right_clavicle", "left_clavicle"]

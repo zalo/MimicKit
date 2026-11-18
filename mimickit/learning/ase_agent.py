@@ -173,11 +173,11 @@ class ASEAgent(amp_agent.AMPAgent):
 
         succ_val = self._compute_succ_val()
         succ_mask = (done == base_env.DoneFlags.SUCC.value)
-        next_vals[succ_mask] = succ_val
+        next_vals = torch.where(succ_mask, succ_val, next_vals)
 
         fail_val = self._compute_fail_val()
         fail_mask = (done == base_env.DoneFlags.FAIL.value)
-        next_vals[fail_mask] = fail_val
+        next_vals = torch.where(fail_mask, fail_val, next_vals)
 
         new_vals = rl_util.compute_td_lambda_return(r, next_vals, done, self._discount, self._td_lambda)
 
@@ -252,11 +252,15 @@ class ASEAgent(amp_agent.AMPAgent):
 
     def _update_enc(self, batch_size, steps):
         info = dict()
+        device_type = torch.device(self._device).type
 
         for i in range(steps):
             batch = self._exp_buffer.sample(batch_size)
-            loss_info = self._compute_enc_loss(batch)
-            loss = loss_info["enc_loss"]
+
+            with torch.amp.autocast(device_type=device_type, enabled=self._use_mixed_precision, dtype=torch.bfloat16):
+                loss_info = self._compute_enc_loss(batch)
+                loss = loss_info["enc_loss"]
+
             self._enc_optimizer.step(loss)
 
             torch_util.add_torch_dict(loss_info, info)
@@ -326,6 +330,7 @@ class ASEAgent(amp_agent.AMPAgent):
         
         return info
     
+    @torch.compile
     def _compute_critic_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
         tar_val = batch["tar_val"]
@@ -341,6 +346,7 @@ class ASEAgent(amp_agent.AMPAgent):
         }
         return info
 
+    @torch.compile
     def _compute_enc_loss(self, batch):
         disc_obs = batch["disc_obs"]
         tar_latents = batch["latents"]

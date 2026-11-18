@@ -83,6 +83,8 @@ class TaskLocationEnv(smp_env.SMPEnv):
         self._prev_root_pos[:] = root_pos
         return
 
+    # not compiled since it writes into the engine's sim state which torch.compile (Inductor) fails to compile
+    @torch.compiler.disable
     def _update_marker(self, env_ids):
         marker_id = self._get_marker_id()
         rot = torch.tensor([0, 0, 0, 1], device=self._device, dtype=torch.float32)
@@ -121,9 +123,8 @@ class TaskLocationEnv(smp_env.SMPEnv):
     
     def _reset_tar(self, env_ids):
         char_id = self._get_char_id()
-        root_pos = self._engine.get_root_pos(char_id)
-
-        char_root_pos = root_pos[env_ids, 0:2]
+        char_root_pos = self._engine.get_root_pos(char_id, env_ids)
+        char_root_pos = char_root_pos[..., 0:2]
 
         rand_dist = (self._tar_dist_max - self._tar_dist_min) * torch.rand_like(char_root_pos[..., 0]) + self._tar_dist_min
         rand_theta = 2 * np.pi * torch.rand_like(char_root_pos[..., 0])
@@ -134,17 +135,16 @@ class TaskLocationEnv(smp_env.SMPEnv):
         self._tar_pos[env_ids, 0:2] = rand_pos
         return
 
+    @torch.compile
     def _compute_obs(self, env_ids=None):
         obs = super()._compute_obs(env_ids)
         
         char_id = self._get_char_id()
-        char_root_pos = self._engine.get_root_pos(char_id)
-        char_root_rot = self._engine.get_root_rot(char_id)
+        char_root_pos = self._engine.get_root_pos_obs(char_id, env_ids)
+        char_root_rot = self._engine.get_root_rot_obs(char_id, env_ids)
         tar_pos = self._tar_pos
 
         if (env_ids is not None):
-            char_root_pos = char_root_pos[env_ids]
-            char_root_rot = char_root_rot[env_ids]
             tar_pos = tar_pos[env_ids]
         
         task_obs = compute_location_observations(char_root_pos, char_root_rot, tar_pos)
@@ -206,17 +206,13 @@ class TaskLocationEnv(smp_env.SMPEnv):
 ###=========================jit functions=========================###
 #####################################################################
 
-@torch.jit.script
 def compute_location_observations(root_pos, root_rot, tar_pos):
-    # type: (Tensor, Tensor, Tensor) -> Tensor
     heading_rot = torch_util.calc_heading_quat_inv(root_rot)
     local_tar_pos = torch_util.quat_rotate(heading_rot, tar_pos - root_pos)
     obs = local_tar_pos[..., 0:2]
     return obs
 
-@torch.jit.script
 def compute_location_reward(root_pos, prev_root_pos, root_rot, tar_pos, tar_speed, dt, dist_threshold, pos_err_scale, vel_err_scale, pos_reward_w, vel_reward_w, face_reward_w):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float, float, float, float, float, float) -> Tensor
     
     pos_diff = tar_pos - root_pos
     pos_err = pos_diff[..., 0] * pos_diff[..., 0] + pos_diff[..., 1] * pos_diff[..., 1]

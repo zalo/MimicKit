@@ -104,6 +104,8 @@ class TaskSteeringEnv(smp_env.SMPEnv):
         self._prev_root_pos[:] = root_pos
         return
 
+    # not compiled since it writes into the engine's sim state which torch.compile (Inductor) fails to compile
+    @torch.compiler.disable
     def _update_marker(self, env_ids):
         tar_dist_min = 1.0
         tar_dist_max = 1.5
@@ -112,8 +114,7 @@ class TaskSteeringEnv(smp_env.SMPEnv):
         tar_marker_id = self._get_tar_marker_id()
         face_marker_id = self._get_face_marker_id()
         
-        root_pos = self._engine.get_root_pos(char_id)
-        root_pos = root_pos[env_ids]
+        root_pos = self._engine.get_root_pos(char_id, env_ids)
         tar_speed = self._tar_speed[env_ids]
         tar_dir = self._tar_dir[env_ids]
         face_dir = self._face_dir[env_ids]
@@ -157,6 +158,9 @@ class TaskSteeringEnv(smp_env.SMPEnv):
 
         if len(rest_env_ids) > 0:
             self._reset_task(rest_env_ids)
+
+        if (self._visualize):
+            self._update_marker(self._env_ids)
         return
     
     def _reset_envs(self, env_ids):
@@ -200,17 +204,17 @@ class TaskSteeringEnv(smp_env.SMPEnv):
         self._face_dir[env_ids] = face_tar_dir
         return
     
+    @torch.compile
     def _compute_obs(self, env_ids=None):
         obs = super()._compute_obs(env_ids)
         
         char_id = self._get_char_id()
-        root_rot = self._engine.get_root_rot(char_id)
+        root_rot = self._engine.get_root_rot_obs(char_id, env_ids)
         tar_dir = self._tar_dir
         tar_speed = self._tar_speed
         face_dir = self._face_dir
 
         if (env_ids is not None):
-            root_rot = root_rot[env_ids]
             tar_dir = tar_dir[env_ids]
             tar_speed = tar_speed[env_ids]
             face_dir = face_dir[env_ids]
@@ -248,9 +252,7 @@ class TaskSteeringEnv(smp_env.SMPEnv):
 ###=========================jit functions=========================###
 #####################################################################
 
-@torch.jit.script
 def compute_steering_observations(root_rot, tar_dir, tar_speed, face_dir):
-    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     
     tar_dir3d = torch.cat([tar_dir, torch.zeros_like(tar_dir[..., 0:1])], dim=-1)
     heading_rot = torch_util.calc_heading_quat_inv(root_rot)
@@ -268,10 +270,8 @@ def compute_steering_observations(root_rot, tar_dir, tar_speed, face_dir):
     return obs
 
 
-@torch.jit.script
 def compute_steering_reward(root_pos, prev_root_pos, root_rot, tar_dir, tar_speed, face_dir, dt,
                            vel_err_scale, tar_reward_w, face_reward_w):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float) -> Tensor
 
     delta_root_pos = root_pos - prev_root_pos
     root_vel = delta_root_pos / dt

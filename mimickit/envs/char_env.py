@@ -166,15 +166,14 @@ class CharEnv(sim_env.SimEnv):
 
         num_joints = self._kin_char_model.get_num_joints()
         for j in range(1, num_joints):
-            curr_joint = self._kin_char_model.get_joint(j)
-            j_dof_dim = curr_joint.get_dof_dim()
+            j_dof_dim = self._kin_char_model.get_joint_dof_dim(j)
 
             if (j_dof_dim > 0):
                 if (j_dof_dim == 3): # 3D spherical j
                     # spherical joints are modeled as exponential maps
                     # so the bounds are computed a bit differently from revolute joints
-                    j_low = curr_joint.get_joint_dof(dof_low)
-                    j_high = curr_joint.get_joint_dof(dof_high)
+                    j_low = self._kin_char_model.get_joint_dof(j, dof_low)
+                    j_high = self._kin_char_model.get_joint_dof(j, dof_high)
                     j_low = np.max(np.abs(j_low))
                     j_high = np.max(np.abs(j_high))
                     curr_scale = max([j_low, j_high])
@@ -183,8 +182,8 @@ class CharEnv(sim_env.SimEnv):
                     curr_low = -curr_scale
                     curr_high = curr_scale
                 else:
-                    j_low = curr_joint.get_joint_dof(dof_low)
-                    j_high = curr_joint.get_joint_dof(dof_high)
+                    j_low = self._kin_char_model.get_joint_dof(j, dof_low)
+                    j_high = self._kin_char_model.get_joint_dof(j, dof_high)
 
                     if (self._zero_center_action):
                         curr_mid = np.zeros_like(j_high)
@@ -199,8 +198,8 @@ class CharEnv(sim_env.SimEnv):
                     curr_low = curr_mid - curr_scale
                     curr_high = curr_mid + curr_scale
 
-                curr_joint.set_joint_dof(curr_low, low)
-                curr_joint.set_joint_dof(curr_high, high)
+                self._kin_char_model.set_joint_dof(j, curr_low, low)
+                self._kin_char_model.set_joint_dof(j, curr_high, high)
 
         return low, high
 
@@ -251,24 +250,16 @@ class CharEnv(sim_env.SimEnv):
                                          self._episode_length)
         return
     
+    @torch.compile
     def _compute_obs(self, env_ids=None):
         char_id = self._get_char_id()
-        root_pos = self._engine.get_root_pos(char_id)
-        root_rot = self._engine.get_root_rot(char_id)
-        root_vel = self._engine.get_root_vel(char_id)
-        root_ang_vel = self._engine.get_root_ang_vel(char_id)
-        dof_pos = self._engine.get_dof_pos(char_id)
-        dof_vel = self._engine.get_dof_vel(char_id)
-        body_pos = self._engine.get_body_pos(char_id)
-
-        if (env_ids is not None):
-            root_pos = root_pos[env_ids]
-            root_rot = root_rot[env_ids]
-            root_vel = root_vel[env_ids]
-            root_ang_vel = root_ang_vel[env_ids]
-            dof_pos = dof_pos[env_ids]
-            dof_vel = dof_vel[env_ids]
-            body_pos = body_pos[env_ids]
+        root_pos = self._engine.get_root_pos_obs(char_id, env_ids)
+        root_rot = self._engine.get_root_rot_obs(char_id, env_ids)
+        root_vel = self._engine.get_root_vel_obs(char_id, env_ids)
+        root_ang_vel = self._engine.get_root_ang_vel_obs(char_id, env_ids)
+        dof_pos = self._engine.get_dof_pos_obs(char_id, env_ids)
+        dof_vel = self._engine.get_dof_vel_obs(char_id, env_ids)
+        body_pos = self._engine.get_body_pos_obs(char_id, env_ids)
 
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
 
@@ -313,9 +304,9 @@ class CharEnv(sim_env.SimEnv):
 
     def _reset_char_rigid_body_state(self, env_ids):
         char_id = self._get_char_id()
-        root_pos = self._engine.get_root_pos(char_id)[env_ids]
-        root_rot = self._engine.get_root_rot(char_id)[env_ids]
-        dof_pos = self._engine.get_dof_pos(char_id)[env_ids]
+        root_pos = self._engine.get_root_pos(char_id, env_ids)
+        root_rot = self._engine.get_root_rot(char_id, env_ids)
+        dof_pos = self._engine.get_dof_pos(char_id, env_ids)
 
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
         body_pos, body_rot = self._kin_char_model.forward_kinematics(root_pos, root_rot, joint_rot)
@@ -366,9 +357,9 @@ class CharEnv(sim_env.SimEnv):
     def _get_char_color(self):
         engine_name = self._engine.get_name()
         if (engine_name == "isaac_lab"):
-            col = np.array([0.2, 0.25, 0.7])
+            col = np.array([0.07, 0.13, 0.35])
         elif (engine_name == "newton"):
-            col = np.array([0.35, 0.45, 0.7])
+            col = np.array([0.3, 0.4, 0.62])
         else:
             col = np.array([0.5, 0.65, 0.95])
         return col
@@ -378,9 +369,7 @@ class CharEnv(sim_env.SimEnv):
 ###=========================jit functions=========================###
 #####################################################################
 
-@torch.jit.script
 def convert_to_local_body_pos(root_rot, body_pos):
-    # type: (Tensor, Tensor) -> Tensor
     
     heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
     heading_rot_expand = heading_inv_rot.unsqueeze(-2)
@@ -393,9 +382,7 @@ def convert_to_local_body_pos(root_rot, body_pos):
 
     return local_body_pos
 
-@torch.jit.script
 def convert_to_local_root_body_pos(root_rot, body_pos):
-    # type: (Tensor, Tensor) -> Tensor
     
     root_inv_rot = torch_util.quat_conjugate(root_rot)
     root_rot_expand = root_inv_rot.unsqueeze(-2)
@@ -408,16 +395,13 @@ def convert_to_local_root_body_pos(root_rot, body_pos):
 
     return local_body_pos
 
-@torch.jit.script
 def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
-    heading_rot = torch_util.calc_heading_quat_inv(root_rot)
-    
     if (global_obs):
         root_rot_obs = torch_util.quat_to_tan_norm(root_rot)
         root_vel_obs = root_vel
         root_ang_vel_obs = root_ang_vel
     else:
+        heading_rot = torch_util.calc_heading_quat_inv(root_rot)
         local_root_rot = torch_util.quat_mul(heading_rot, root_rot)
         root_rot_obs = torch_util.quat_to_tan_norm(local_root_rot)
         root_vel_obs = torch_util.quat_rotate(heading_rot, root_vel)
@@ -445,16 +429,12 @@ def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_
     obs = torch.cat(obs, dim=-1)
     return obs
 
-@torch.jit.script
 def compute_reward(root_pos):
-    # type: (Tensor) -> Tensor
     r = torch.ones_like(root_pos[..., 0])
     return r
 
-@torch.jit.script
 def compute_done(done_buf, time, ep_len):
-    # type: (Tensor, Tensor, float) -> Tensor
     timeout = time >= ep_len
     done = torch.full_like(done_buf, base_env.DoneFlags.NULL.value)
-    done[timeout] = base_env.DoneFlags.TIME.value
+    done.masked_fill_(timeout, base_env.DoneFlags.TIME.value)
     return done

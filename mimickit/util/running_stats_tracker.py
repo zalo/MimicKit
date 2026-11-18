@@ -4,8 +4,8 @@ class RunningStatsTracker():
     def __init__(self, num_entries, window_size, device):
         self._window_size = window_size
         self._vals = torch.zeros([num_entries, window_size], device=device, dtype=torch.float32)
-        self._counts = torch.zeros([num_entries], device=device, dtype=torch.int)
-        self._heads = torch.zeros([num_entries], device=device, dtype=torch.int)
+        self._counts = torch.zeros([num_entries], device=device, dtype=torch.long)
+        self._heads = torch.zeros([num_entries], device=device, dtype=torch.long)
         self._means = torch.zeros([num_entries], device=device, dtype=torch.float32)
         self._need_update = torch.zeros([num_entries], device=device, dtype=torch.bool)
         self._has_new_vals = False

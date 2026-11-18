@@ -44,3 +44,6 @@ reward_steering_tar_w: 0.7
 reward_steering_face_w: 0.3
 
 reward_steering_vel_scale: 2.0
+
+engine:
+    base_links: ["pelvis", "torso", "right_clavicle", "left_clavicle"]

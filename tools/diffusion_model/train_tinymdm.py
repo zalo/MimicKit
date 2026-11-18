@@ -30,14 +30,14 @@ def build_logger(log_file):
     return log
 
 @torch.no_grad()
-def generate(model, dataset, obs_space, config, out_motion_dir, enable_ema=False, num_samples=16):
+def generate(model, dataset, obs_space, config, device, out_motion_dir, enable_ema=False, num_samples=16):
     fps = dataset.control_freq
     num_frames = obs_space.shape[-1] // config["input_channel"]
 
     if enable_ema:
-        gen_samples = model.sample_ema(shape=obs_space.shape, batch_size=num_samples, device=config['device'])
+        gen_samples = model.sample_ema(shape=obs_space.shape, batch_size=num_samples, device=device)
     else:
-        gen_samples = model.sample(shape=obs_space.shape, batch_size=num_samples, device=config['device'])
+        gen_samples = model.sample(shape=obs_space.shape, batch_size=num_samples, device=device)
 
     gen_samples = model.unnormalize(gen_samples.reshape([num_samples, num_frames, -1]))
 
@@ -54,10 +54,10 @@ def generate(model, dataset, obs_space, config, out_motion_dir, enable_ema=False
     return
     
 @torch.no_grad()
-def test(cfg_path, model_file, out_dir=None, num_samples=16):
+def test(cfg_path, model_file, out_dir=None, num_samples=16, device="cuda"):
     fixseed(0)
     assert(out_dir is not None and out_dir != ""), "Must specify --out_dir"
-    assert(args.model_file != ""), "Must specify --model_file"
+    assert(model_file != ""), "Must specify --model_file"
 
     with open(cfg_path, "r") as stream:
         config = yaml.safe_load(stream)
@@ -69,24 +69,24 @@ def test(cfg_path, model_file, out_dir=None, num_samples=16):
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(out_motion_dir, exist_ok=True)
 
-    dataset_env = MotionPriorData(config)
+    dataset_env = MotionPriorData(config, device)
     obs_space = dataset_env.get_obs_space()
     num_obs_steps = env_config["num_disc_obs_steps"]
     config["input_dim"] = obs_space.shape[-1]
     config["input_channel"] = int(config["input_dim"] / num_obs_steps)
 
-    priormodel = TinyMDMModel(config)
-    prior_state_dict = torch.load(model_file, map_location=config["device"])
+    priormodel = TinyMDMModel(config, device)
+    prior_state_dict = torch.load(model_file, map_location=device)
     priormodel.load_state_dict(prior_state_dict)
     
     priormodel.eval()
-    priormodel.to(config["device"])
+    priormodel.to(device)
     
-    generate(priormodel, dataset_env, obs_space, config, out_motion_dir=out_motion_dir,
+    generate(priormodel, dataset_env, obs_space, config, device, out_motion_dir=out_motion_dir,
             enable_ema=priormodel.model_ema, num_samples=num_samples)
     return
 
-def train(cfg_path, out_dir=None):
+def train(cfg_path, out_dir=None, device="cuda"):
     assert out_dir is not None and out_dir != "", "Must specify --out_dir"
     
     with open(cfg_path, "r") as stream:
@@ -117,7 +117,7 @@ def train(cfg_path, out_dir=None):
     output_iter = config.get("output_iter", 2_000)
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
 
-    dataset_env = MotionPriorData(config)
+    dataset_env = MotionPriorData(config, device)
     obs_space = dataset_env.get_obs_space()
     num_obs_steps = env_config["num_disc_obs_steps"]
     
@@ -126,10 +126,10 @@ def train(cfg_path, out_dir=None):
     print(f"Input_channel: {config['input_channel']}")
 
     samples = dataset_env.fetch_obs_demo(num_samples_stat)
-    model = TinyMDMModel(config)
+    model = TinyMDMModel(config, device)
     model.update_normalizer(samples)
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['lr'])
-    model.to(config['device'])
+    model.to(device)
     
     model.train()
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -141,7 +141,7 @@ def train(cfg_path, out_dir=None):
 
     while curr_iters < num_iters:
         samples = dataset_env.fetch_obs_demo(batch_size).clone().detach()
-        samples = samples.to(config['device'])
+        samples = samples.to(device)
         samples = model.normalize(samples.reshape(batch_size, -1, config["input_channel"])).reshape(batch_size, -1)
 
         loss = model(samples)
@@ -157,7 +157,7 @@ def train(cfg_path, out_dir=None):
 
         if (curr_iters % output_iter == 0 and curr_iters != 0) or (curr_iters == num_iters - 1):
             model.eval()
-            generate(model, dataset_env, obs_space, config, out_motion_dir=out_motion_dir,
+            generate(model, dataset_env, obs_space, config, device, out_motion_dir=out_motion_dir,
                     enable_ema=model.model_ema, num_samples=16)
             torch.save(model.state_dict(), out_model_file)
             model.train()
@@ -180,11 +180,12 @@ if __name__ == "__main__":
     parser.add_argument("--cfg_path", type=str, default="tools/diffusion_model/config/tinymdm.yaml")
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--model_file", type=str, default="")
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
     if args.mode == "train":
         print("Training new model...")
-        train(args.cfg_path, out_dir=args.out_dir)
+        train(args.cfg_path, out_dir=args.out_dir, device=args.device)
     else:
         print("Testing model...")
-        test(args.cfg_path, args.model_file, out_dir=args.out_dir)
+        test(args.cfg_path, args.model_file, out_dir=args.out_dir, device=args.device)

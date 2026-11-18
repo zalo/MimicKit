@@ -151,6 +151,7 @@ class BaseAgent(torch.nn.Module):
         self._test_episodes = config["test_episodes"]
         
         self._steps_per_iter = config["steps_per_iter"]
+        self._use_mixed_precision = config.get("use_mixed_precision", False)
         return
 
     def _build_normalizers(self):
@@ -349,10 +350,13 @@ class BaseAgent(torch.nn.Module):
         return val_fail
 
     def _log_train_info(self, train_info, test_info, env_diag_info, start_time):
-        wall_time = (time.time() - start_time) / (60 * 60) # store time in hours
+        wall_time_secs = time.time() - start_time
+        wall_time_hrs = wall_time_secs / (60 * 60) # store time in hours
+        
         self._logger.log("Iteration", self._iter, collection="1_Info")
-        self._logger.log("Wall_Time", wall_time, collection="1_Info")
+        self._logger.log("Wall_Time", wall_time_hrs, collection="1_Info")
         self._logger.log("Samples", self._sample_count, collection="1_Info")
+        self._logger.log("Samples_Per_Second", self._sample_count / wall_time_secs, collection="1_Info", quiet=True)
         
         test_return = test_info["mean_return"]
         test_ep_len = test_info["mean_ep_len"]

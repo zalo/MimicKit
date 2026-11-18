@@ -105,18 +105,20 @@ class Logger:
             for key in self.log_headers:
                 entry = self.log_current_row.get(key, "")
 
-                if (isinstance(entry.val, numbers.Number)):
-                    val = entry.val
+                if (not entry.quiet):
+                    if (isinstance(entry.val, numbers.Number)):
+                        val = entry.val
 
-                    if isinstance(val, float):
-                        valstr = "%8.3g"%val
-                    elif isinstance(val, int):
-                        valstr = str(val)
-                    else: 
-                        valstr = val
+                        if isinstance(val, float):
+                            valstr = "%8.3g"%val
+                        elif isinstance(val, int):
+                            valstr = str(val)
+                        else: 
+                            valstr = val
 
-                    Logger.print(format_str%(key, valstr))
-                    vals.append(val)
+                        Logger.print(format_str%(key, valstr))
+                        vals.append(val)
+            
             Logger.print("-" * (22 + key_spacing))
         return
 

@@ -168,6 +168,7 @@ class SimEnv(base_env.BaseEnv):
                 self._obs_buf[env_ids] = obs
         return
 
+    @torch.compile
     def _post_physics_step(self):
         self._update_time()
         self._update_misc()
@@ -176,7 +177,7 @@ class SimEnv(base_env.BaseEnv):
         self._update_reward()
         self._update_done()
         return
-
+    
     def _build_engine(self, engine_config, num_envs, device, visualize, record_video=False):
         engine = engine_builder.build_engine(engine_config, num_envs, device, visualize, record_video=record_video)
         return engine
@@ -195,7 +196,7 @@ class SimEnv(base_env.BaseEnv):
 
         self._reward_buf = torch.zeros(num_envs, device=self._device, dtype=torch.float)
         self._done_buf = torch.zeros(num_envs, device=self._device, dtype=torch.int)
-        self._timestep_buf = torch.zeros(num_envs, device=self._device, dtype=torch.int)
+        self._timestep_buf = torch.zeros(num_envs, device=self._device, dtype=torch.long)
         self._time_buf = torch.zeros(num_envs, device=self._device, dtype=torch.float)
 
         obs_space = self.get_obs_space()
@@ -208,9 +209,9 @@ class SimEnv(base_env.BaseEnv):
     @abc.abstractmethod
     def _reset_envs(self, env_ids):
         if (len(env_ids) > 0):
-            self._timestep_buf[env_ids] = 0
-            self._time_buf[env_ids] = 0
-            self._done_buf[env_ids] = base_env.DoneFlags.NULL.value
+            self._timestep_buf.index_fill_(0, env_ids, 0)
+            self._time_buf.index_fill_(0, env_ids, 0)
+            self._done_buf.index_fill_(0, env_ids, base_env.DoneFlags.NULL.value)
         return
     
     def _update_time(self):

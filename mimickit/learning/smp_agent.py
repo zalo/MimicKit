@@ -61,7 +61,7 @@ class SMPAgent(ppo_agent.PPOAgent):
         disc_obs_space = self._env.get_disc_obs_space()
 
         config["input_dim"] = disc_obs_space.shape[-1]
-        self._prior_model = TinyMDMModel(config)
+        self._prior_model = TinyMDMModel(config, self._device)
 
         prior_state_dict = torch.load(model_path, map_location=self._device)
         incompatible_keys = self._prior_model.load_state_dict(prior_state_dict)
@@ -79,7 +79,12 @@ class SMPAgent(ppo_agent.PPOAgent):
 
         for p in self._prior_model.parameters():
             p.requires_grad = False
-        
+
+        # compile the denoisers used to compute rewards
+        self._prior_model.dmodel.compile()
+        if self._prior_model.model_ema:
+            self._prior_model.ema_dmodel.ema_model.compile()
+
         return
 
     def _check_prior_env_config(self, prior_config):

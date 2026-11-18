@@ -141,7 +141,7 @@ class ViewMotionEnv(char_env.CharEnv):
     def _get_char_color(self):
         engine_name = self._engine.get_name()
         if (engine_name == "isaac_lab"):
-            col = np.array([0.25, 0.4, 0.1])
+            col = np.array([0.07, 0.22, 0.01])
         elif (engine_name == "newton"):
             col = np.array([0.3, 0.5, 0.1])
         else:
@@ -149,9 +149,7 @@ class ViewMotionEnv(char_env.CharEnv):
         return col
 
 
-@torch.jit.script
 def compute_done(done_buf, time, motion_len, motion_loop_mode):
-    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     num_loops = 5
 
     timeout = torch.zeros_like(done_buf)
